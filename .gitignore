@@ -1,0 +1,32 @@
+# 参考源码（只读对照，不入库）
+vllm-src/
+
+# 模型权重（本地 /models，HF hub 结构）
+models/
+
+# agent 工具目录
+.codeartsdoer/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 大文件与中间产物（golden 数据用脚本确定性再生成，只入库小快照）
+*.npy
+*.safetensors
+*.bin
+*.pt
+*.pth
+
+# CUDA / Triton 编译缓存
+.cache/
+triton_cache/
+inductor_cache/
+
+# IDE / 系统
+.idea/
+.vscode/
+.DS_Store
