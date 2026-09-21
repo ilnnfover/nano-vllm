@@ -81,7 +81,16 @@ class Attention(nn.Module):
         self.v_proj = nn.Linear(config.hidden_size, config.num_key_value_heads * config.head_dim, bias=True)
         self.o_proj = nn.Linear(config.num_attention_heads * config.head_dim, config.hidden_size, bias=False)
 
-    def forward(self, hidden_states: torch.Tensor, position_embeddings) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings,
+        kv_cache=None,
+        layer_idx: int = 0,
+        is_prefill: bool = True,
+        cache_seq_len: int = 0,
+        attn_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         b, s, _ = hidden_states.shape
         q = self.q_proj(hidden_states).view(b, s, self.num_heads, self.head_dim).transpose(1, 2)
         k = self.k_proj(hidden_states).view(b, s, self.num_kv_heads, self.head_dim).transpose(1, 2)
@@ -90,14 +99,31 @@ class Attention(nn.Module):
         cos, sin = position_embeddings
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
+        if kv_cache is not None:
+            kv_cache.write(layer_idx, k, v, cache_seq_len)
+            total_len = cache_seq_len + s
+            if is_prefill:
+                k_attn, v_attn = k, v
+            else:
+                k_attn, v_attn = kv_cache.read(layer_idx, total_len)
+        else:
+            k_attn, v_attn = k, v
+
+        use_mask = attn_mask is not None
+        is_causal = is_prefill and not use_mask
+
         if self.num_kv_groups > 1 and q.is_cuda and self.head_dim <= 256:
             out = F.scaled_dot_product_attention(
-                q, k, v, scale=self.scaling, is_causal=True, enable_gqa=True
+                q, k_attn, v_attn, attn_mask=attn_mask,
+                scale=self.scaling, is_causal=is_causal, enable_gqa=True,
             )
         else:
-            k = repeat_kv(k, self.num_kv_groups)
-            v = repeat_kv(v, self.num_kv_groups)
-            out = F.scaled_dot_product_attention(q, k, v, scale=self.scaling, is_causal=True)
+            k_attn = repeat_kv(k_attn, self.num_kv_groups)
+            v_attn = repeat_kv(v_attn, self.num_kv_groups)
+            out = F.scaled_dot_product_attention(
+                q, k_attn, v_attn, attn_mask=attn_mask,
+                scale=self.scaling, is_causal=is_causal,
+            )
         out = out.transpose(1, 2).reshape(b, s, -1)
         return self.o_proj(out)
 
@@ -122,10 +148,24 @@ class DecoderLayer(nn.Module):
         self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
 
-    def forward(self, hidden_states: torch.Tensor, position_embeddings) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings,
+        kv_cache=None,
+        layer_idx: int = 0,
+        is_prefill: bool = True,
+        cache_seq_len: int = 0,
+        attn_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(hidden_states, position_embeddings)
+        hidden_states = self.self_attn(
+            hidden_states, position_embeddings,
+            kv_cache=kv_cache, layer_idx=layer_idx,
+            is_prefill=is_prefill, cache_seq_len=cache_seq_len,
+            attn_mask=attn_mask,
+        )
         hidden_states = residual + hidden_states
 
         residual = hidden_states
@@ -143,15 +183,31 @@ class Qwen2Model(nn.Module):
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.rotary_emb = RotaryEmbedding(config.head_dim, config.rope_theta)
 
-    def forward(self, input_ids: torch.Tensor, output_hidden_states: bool = False):
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        output_hidden_states: bool = False,
+        kv_cache=None,
+        is_prefill: bool = True,
+        cache_seq_len: int = 0,
+        attn_mask: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+    ):
         b, s = input_ids.shape
-        position_ids = torch.arange(s, device=input_ids.device).unsqueeze(0)
+        if position_ids is None:
+            start = 0 if is_prefill else cache_seq_len
+            position_ids = torch.arange(start, start + s, device=input_ids.device).unsqueeze(0).expand(b, -1)
         hidden_states = self.embed_tokens(input_ids)
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
         all_hidden = [hidden_states] if output_hidden_states else None
-        for layer in self.layers:
-            hidden_states = layer(hidden_states, position_embeddings)
+        for layer_idx, layer in enumerate(self.layers):
+            hidden_states = layer(
+                hidden_states, position_embeddings,
+                kv_cache=kv_cache, layer_idx=layer_idx,
+                is_prefill=is_prefill, cache_seq_len=cache_seq_len,
+                attn_mask=attn_mask,
+            )
             if output_hidden_states:
                 all_hidden.append(hidden_states)
 
@@ -170,8 +226,22 @@ class Qwen2ForCausalLM(nn.Module):
         if config.tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight
 
-    def forward(self, input_ids: torch.Tensor, output_hidden_states: bool = False):
-        hidden_states, all_hidden = self.model(input_ids, output_hidden_states)
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        output_hidden_states: bool = False,
+        kv_cache=None,
+        is_prefill: bool = True,
+        cache_seq_len: int = 0,
+        attn_mask: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+    ):
+        hidden_states, all_hidden = self.model(
+            input_ids, output_hidden_states,
+            kv_cache=kv_cache, is_prefill=is_prefill,
+            cache_seq_len=cache_seq_len, attn_mask=attn_mask,
+            position_ids=position_ids,
+        )
         logits = self.lm_head(hidden_states)
         return logits, all_hidden
 
