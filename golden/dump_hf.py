@@ -69,6 +69,8 @@ def main() -> None:
             do_sample=False,
             max_new_tokens=args.gen_tokens,
             pad_token_id=cfg.eos_token_id,
+            use_cache=False,
+            repetition_penalty=1.0,
         )
     np.save(out_dir / "greedy_ids.npy", gen.cpu().numpy())
 

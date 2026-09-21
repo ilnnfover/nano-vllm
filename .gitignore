@@ -1,8 +1,8 @@
 # 参考源码（只读对照，不入库）
 vllm-src/
 
-# 模型权重（本地 /models，HF hub 结构）
-models/
+# 模型权重（仅顶层 /models，HF hub 结构；不影响 nano_vllm/models/）
+/models/
 
 # agent 工具目录
 .codeartsdoer/

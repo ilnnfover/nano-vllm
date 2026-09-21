@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
-"""P0 · 本地 benchmark：对指定 backend 逐条测量 TTFT / TPOT / 吞吐。
+"""本地 benchmark：对指定 backend 逐条测量 TTFT / TPOT / 吞吐。
 
-P0 仅支持 --backend hf（HF transformers 手写 decode 循环，精确插桩）；
-P1 起新 backend 注册进 BACKENDS 字典即可复用同一口径。
+Backend 统一接口: prefill(prompt_ids) -> last_logits, step(tok) -> last_logits
+（状态由 backend 自持：hf 用 DynamicCache，nano 全量重算）。P1 起两种后端共用同一计时代码。
 
 口径定义:
   TTFT  = prefill 一次前向的耗时 (ms)
   TPOT  = decode 阶段每 token 均耗时 (ms)，即逐条 decode 步均值
-  吞吐  = output_tok/s 与 total_tok/s（含 prefill）
+  吞吐  = output_tok/s（含 prefill 总时间摊入）
 输出: bench/results/{tag}.json
 """
 from __future__ import annotations
+
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import argparse
 import json
@@ -24,47 +28,76 @@ import torch
 import transformers
 
 
-def build_hf(model_path: str, device: str, dtype: torch.dtype):
-    from transformers import AutoModelForCausalLM
+class HFBackend:
+    def __init__(self, model_path: str, device: str, dtype: torch.dtype) -> None:
+        from transformers import AutoModelForCausalLM, DynamicCache
 
-    model = (
-        AutoModelForCausalLM.from_pretrained(
-            model_path, dtype=dtype, attn_implementation="sdpa"
+        self.model = (
+            AutoModelForCausalLM.from_pretrained(model_path, dtype=dtype, attn_implementation="sdpa")
+            .to(device)
+            .eval()
         )
-        .to(device)
-        .eval()
-    )
-    return model
+        self._cache_cls = DynamicCache
+        self.device = device
+        self.cache = None
+
+    @torch.no_grad()
+    def prefill(self, prompt_ids: list[int]) -> torch.Tensor:
+        self.cache = self._cache_cls()
+        t = torch.tensor([prompt_ids], dtype=torch.long, device=self.device)
+        out = self.model(input_ids=t, past_key_values=self.cache, use_cache=True)
+        return out.logits[0, -1]
+
+    @torch.no_grad()
+    def step(self, tok: int) -> torch.Tensor:
+        t = torch.tensor([[tok]], dtype=torch.long, device=self.device)
+        out = self.model(input_ids=t, past_key_values=self.cache, use_cache=True)
+        return out.logits[0, -1]
 
 
-BACKENDS = {"hf": build_hf}
+class NanoBackend:
+    def __init__(self, model_path: str, device: str, dtype: torch.dtype) -> None:
+        from nano_vllm.model_executor.runner import NanoRunner
+
+        self.runner = NanoRunner(model_path, device=device, dtype=dtype)
+        self.device = device
+        self.ids: list[int] = []
+
+    @torch.no_grad()
+    def prefill(self, prompt_ids: list[int]) -> torch.Tensor:
+        self.ids = list(prompt_ids)
+        return self.runner.forward_last_logits(self.ids)
+
+    @torch.no_grad()
+    def step(self, tok: int) -> torch.Tensor:
+        self.ids.append(tok)
+        return self.runner.forward_last_logits(self.ids)
 
 
-def run_one(model, prompt_ids: list[int], output_len: int, device: str) -> dict:
-    torch.cuda.synchronize() if device == "cuda" else None
-    input_ids = torch.tensor([prompt_ids], dtype=torch.long, device=device)
+BACKENDS = {"hf": HFBackend, "nano": NanoBackend}
+
+
+def run_one(backend, prompt_ids: list[int], output_len: int, device: str) -> dict:
+    if device == "cuda":
+        torch.cuda.synchronize()
 
     t0 = time.perf_counter()
-    with torch.no_grad():
-        out = model(input_ids=input_ids, use_cache=True)
+    last = backend.prefill(prompt_ids)
     if device == "cuda":
         torch.cuda.synchronize()
     prefill_ms = (time.perf_counter() - t0) * 1e3
 
-    next_tok = out.logits[0, -1].argmax()
-    past = out.past_key_values
+    next_tok = int(last.argmax())
     decode_ms = []
-    gen = [int(next_tok)]
+    gen = [next_tok]
     for _ in range(output_len - 1):
         t1 = time.perf_counter()
-        with torch.no_grad():
-            out = model(input_ids=next_tok.view(1, 1), past_key_values=past, use_cache=True)
+        last = backend.step(next_tok)
         if device == "cuda":
             torch.cuda.synchronize()
         decode_ms.append((time.perf_counter() - t1) * 1e3)
-        next_tok = out.logits[0, -1].argmax()
-        past = out.past_key_values
-        gen.append(int(next_tok))
+        next_tok = int(last.argmax())
+        gen.append(next_tok)
 
     return {
         "prefill_ms": prefill_ms,
@@ -93,36 +126,27 @@ def main() -> None:
     np.random.seed(42)
 
     ds = json.loads(Path(args.dataset).read_text())
-    requests = [
-        r for r in ds["requests"] if r["category"] in set(args.categories)
-    ]
+    requests = [r for r in ds["requests"] if r["category"] in set(args.categories)]
     if args.limit:
         requests = requests[: args.limit]
     assert requests, "没有匹配的数据条目"
 
     print(f"[bench] backend={args.backend} model={args.model} device={device} dtype={args.dtype}")
-    model = BACKENDS[args.backend](args.model, device, dtype)
+    backend = BACKENDS[args.backend](args.model, device, dtype)
     if device == "cuda":
         print(
             f"[bench] GPU: {torch.cuda.get_device_name(0)}, "
             f"显存 {torch.cuda.get_device_properties(0).total_memory / 2**30:.1f} GiB"
         )
 
-    # 预热：消除首条的首帧开销（kernel 加载 / CUDA context）
     warm = requests[0]
-    run_one(model, warm["prompt_ids"][:64], 4, device)
+    run_one(backend, warm["prompt_ids"][:64], 4, device)
     print(f"[bench] 预热完成, 开始 {len(requests)} 条")
 
     results = []
     for r in requests:
-        rec = run_one(model, r["prompt_ids"], r["output_len"], device)
-        rec.update(
-            {
-                "id": r["id"],
-                "category": r["category"],
-                "prompt_len": r["prompt_len"],
-            }
-        )
+        rec = run_one(backend, r["prompt_ids"], r["output_len"], device)
+        rec.update({"id": r["id"], "category": r["category"], "prompt_len": r["prompt_len"]})
         results.append(rec)
         print(
             f"  #{r['id']:<3} {r['category']:<13} prompt={r['prompt_len']:<6} "
