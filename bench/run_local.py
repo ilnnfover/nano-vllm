@@ -60,10 +60,10 @@ class HFBackend:
 class NanoBackend:
     """use_cache=True 走 P2 prefill+decode（KV cache），False 走 P1 eager 全量重算。"""
 
-    def __init__(self, model_path: str, device: str, dtype: torch.dtype, use_cache: bool = True) -> None:
+    def __init__(self, model_path: str, device: str, dtype: torch.dtype, use_cache: bool = True, max_seq_len: int = 1024) -> None:
         from nano_vllm.model_executor.runner import NanoRunner
 
-        self.runner = NanoRunner(model_path, device=device, dtype=dtype)
+        self.runner = NanoRunner(model_path, device=device, dtype=dtype, max_seq_len=max_seq_len)
         self.device = device
         self.use_cache = use_cache
         self.ids: list[int] = []
@@ -131,6 +131,8 @@ def main() -> None:
     p.add_argument("--dtype", default="bf16", choices=["bf16", "fp32"])
     p.add_argument("--tag", default=None, help="结果文件名，默认自动生成")
     p.add_argument("--results-dir", default="bench/results")
+    p.add_argument("--max-seq-len", type=int, default=None,
+                   help="KV cache 预分配长度；默认按数据自动: max(prompt_len)+max(output_len) 向上取 256 倍数")
     args = p.parse_args()
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -144,8 +146,18 @@ def main() -> None:
         requests = requests[: args.limit]
     assert requests, "没有匹配的数据条目"
 
+    if args.max_seq_len is not None:
+        max_seq_len = args.max_seq_len
+    else:
+        need = max(r["prompt_len"] + r["output_len"] for r in requests)
+        max_seq_len = (need + 255) // 256 * 256
+
     print(f"[bench] backend={args.backend} model={args.model} device={device} dtype={args.dtype}")
-    backend = BACKENDS[args.backend](args.model, device, dtype)
+    if args.backend.startswith("nano"):
+        backend = BACKENDS[args.backend](args.model, device, dtype, max_seq_len=max_seq_len)
+        print(f"[bench] max_seq_len={max_seq_len}")
+    else:
+        backend = BACKENDS[args.backend](args.model, device, dtype)
     if device == "cuda":
         print(
             f"[bench] GPU: {torch.cuda.get_device_name(0)}, "
