@@ -104,7 +104,7 @@ golden/
 - **Benchmark**：batch=1 TPOT（P1 vs P2 提升倍数）；静态批 batch=8/16 吞吐 vs 串行
 
 ### P3 · PagedAttention 与首个自研算子（核心里程碑）
-- **必须实现**：BlockPool（free list）/ block_table / slot_mapping；`reshape_and_cache` 写入核；**decode 用自研 Triton paged attention kernel**（含间接寻址 gather）；prefill 先调 flash-attn 的 paged/varlen 接口（自研 prefill kernel 不阻塞本阶段）；block_size 常量进 config
+- **必须实现**：BlockPool（free list）/ block_table / slot_mapping；`reshape_and_cache` 写入核；**decode 用自研 Triton paged attention kernel**（含间接寻址 gather）；prefill 用 SDPA + is_causal=True（零新依赖，单条不拼批）；flash-attn varlen 接口留作 P4 消除 padding 的选项；block_size 常量进 config
 - **参考源码**：`vllm/v1/core/block_pool.py`、`vllm/v1/attention/backends/triton_attn.py`、`vllm/attention/`（旧版 kernels 思路）
 - **验证产出**：Triton kernel vs torch 朴素实现 vs SDPA 的数值对拍与延迟曲线脚本；不同 block_size 的扫描脚本
 - **完成标准**：KV 浪费率从 P2 的 X% 降到 <2%；自研 kernel 数值对拍通过（相对误差 <1e-2）；长上下文（32K 单条）可跑通

@@ -21,9 +21,9 @@ SPEC = {
     "short": {"count": 8, "prompt_len": 128, "output_len": 64},
     "medium": {"count": 8, "prompt_len": 1024, "output_len": 128},
     "long": {"count": 1, "prompt_len": 8192, "output_len": 256},
-    "shared_prefix": {"count": 4, "prompt_len": 32768 + 64, "output_len": 128},
+    "shared_prefix": {"count": 4, "prompt_len": 32704 + 64, "output_len": 128},
 }
-SHARED_PREFIX_LEN = 32768
+SHARED_PREFIX_LEN = 32704
 VOCAB = 151936
 ID_LO, ID_HI = 100, VOCAB - 400  # 避开 Qwen2 特殊 token 区 (≥151643)
 

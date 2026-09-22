@@ -85,7 +85,7 @@ class TestP2Correctness(unittest.TestCase):
             MODEL, device="cpu", dtype=torch.float32, max_seq_len=8,
         )
         ids = self.prompts[0]  # len > 8
-        with self.assertRaises(Exception):
+        with self.assertRaises(ValueError):
             r.generate(ids, SamplingParams(temperature=0.0, max_new_tokens=4), use_cache=True)
 
 

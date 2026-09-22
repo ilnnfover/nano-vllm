@@ -23,7 +23,7 @@ import platform
 import statistics
 import time
 from functools import partial
-from pathlib import Path
+
 
 import numpy as np
 import torch
@@ -153,7 +153,7 @@ def main() -> None:
         max_seq_len = (need + 255) // 256 * 256
 
     print(f"[bench] backend={args.backend} model={args.model} device={device} dtype={args.dtype}")
-    if args.backend.startswith("nano"):
+    if args.backend.startswith("nano"):  
         backend = BACKENDS[args.backend](args.model, device, dtype, max_seq_len=max_seq_len)
         print(f"[bench] max_seq_len={max_seq_len}")
     else:

@@ -67,7 +67,7 @@ def main() -> int:
             all_pass = False
             continue
         mx, mean, rel = compare_npy(fname, a, b)
-        limit = args.tol if fname.startswith("hidden") else args.tol
+        limit = args.tol
         ok = mx <= limit
         all_pass &= ok
         if mx > worst:
