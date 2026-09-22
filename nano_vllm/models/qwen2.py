@@ -235,6 +235,7 @@ class Qwen2ForCausalLM(nn.Module):
         cache_seq_len: int = 0,
         attn_mask: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
+        last_idx: torch.Tensor | None = None,
     ):
         hidden_states, all_hidden = self.model(
             input_ids, output_hidden_states,
@@ -242,7 +243,12 @@ class Qwen2ForCausalLM(nn.Module):
             cache_seq_len=cache_seq_len, attn_mask=attn_mask,
             position_ids=position_ids,
         )
-        logits = self.lm_head(hidden_states)
+        if last_idx is not None:
+            b = hidden_states.shape[0]
+            selected = hidden_states[torch.arange(b, device=hidden_states.device), last_idx]
+            logits = self.lm_head(selected)
+        else:
+            logits = self.lm_head(hidden_states)
         return logits, all_hidden
 
     @torch.no_grad()

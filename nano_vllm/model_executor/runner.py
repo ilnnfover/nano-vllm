@@ -56,16 +56,18 @@ class NanoRunner:
     @torch.no_grad()
     def forward_last_logits(self, ids: list[int]) -> torch.Tensor:
         t = torch.tensor([ids], dtype=torch.long, device=self.device)
-        logits, _ = self.model(t)
-        return logits[0, -1]
+        last_idx = torch.tensor([len(ids) - 1], device=self.device)
+        logits, _ = self.model(t, last_idx=last_idx)
+        return logits[0]
 
     @torch.no_grad()
     def _prefill(self, prompt_ids: list[int]) -> torch.Tensor:
         self.kv_cache.reset()
         t = torch.tensor([prompt_ids], dtype=torch.long, device=self.device)
-        logits, _ = self.model(t, kv_cache=self.kv_cache, is_prefill=True, cache_seq_len=0)
+        last_idx = torch.tensor([len(prompt_ids) - 1], device=self.device)
+        logits, _ = self.model(t, kv_cache=self.kv_cache, is_prefill=True, cache_seq_len=0, last_idx=last_idx)
         self.kv_cache.seq_len = len(prompt_ids)
-        return logits[0, -1]
+        return logits[0]
 
     @torch.no_grad()
     def _decode(self, tok: int) -> torch.Tensor:
@@ -156,14 +158,15 @@ class NanoRunner:
             prefill_pos[i, :l] = torch.arange(l, device=self.device)
 
         prefill_mask = self._build_prefill_mask(attn)
+        last_idx = torch.tensor([l - 1 for l in prompt_lens], device=self.device)
         logits, _ = self.model(
             input_ids, kv_cache=batch_cache, is_prefill=True,
             cache_seq_len=0, attn_mask=prefill_mask, position_ids=prefill_pos,
+            last_idx=last_idx,
         )
         batch_cache.seq_len = max_prompt
 
-        last_idx = torch.tensor([l - 1 for l in prompt_lens], device=self.device)
-        last_logits = logits[torch.arange(b, device=self.device), last_idx]
+        last_logits = logits
 
         valid_mask = attn.clone()
         seq_lens = list(prompt_lens)
