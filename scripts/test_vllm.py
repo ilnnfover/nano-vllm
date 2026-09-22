@@ -4,7 +4,7 @@ vLLM 冒烟测试 + 连续批处理吞吐观察。
 
 运行:
     source ~/venvs/vllm/bin/activate
-    python test_vllm.py
+    python scripts/test_vllm.py
 
 做三件事:
   1. 确认 vLLM 真的跑在 GPU 上(不是静默退回 CPU)

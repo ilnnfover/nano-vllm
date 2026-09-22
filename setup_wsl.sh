@@ -524,19 +524,19 @@ stage6_ops() {
 # ================================================================== 阶段 7
 stage7_verify() {
   log "阶段 7/7  自检"
-  if [[ -f "$SCRIPT_DIR/verify_env.py" ]]; then
+  if [[ -f "$SCRIPT_DIR/scripts/verify_env.py" ]]; then
     # shellcheck disable=SC1091
     source "$VENVS/dev/bin/activate"
-    python "$SCRIPT_DIR/verify_env.py" || warn "自检有失败项, 看上面的输出"
+    python "$SCRIPT_DIR/scripts/verify_env.py" || warn "自检有失败项, 看上面的输出"
   else
-    warn "找不到 verify_env.py (应在 $SCRIPT_DIR)"
+    warn "找不到 verify_env.py (应在 $SCRIPT_DIR/scripts)"
   fi
 
   if [[ "${RUN_SMOKE:-0}" == "1" ]]; then
     # shellcheck disable=SC1091
     source "$VENVS/vllm/bin/activate"
-    [[ -f "$SCRIPT_DIR/test_vllm.py" ]] && python "$SCRIPT_DIR/test_vllm.py" \
-      || warn "找不到 test_vllm.py"
+    [[ -f "$SCRIPT_DIR/scripts/test_vllm.py" ]] && python "$SCRIPT_DIR/scripts/test_vllm.py" \
+      || warn "找不到 scripts/test_vllm.py"
   else
     dim "加 RUN_SMOKE=1 可再跑 vLLM 冒烟测试(会下载模型)"
   fi
@@ -587,7 +587,7 @@ case "$MODE" in
   接下来:
     source ~/venvs/dev/bin/activate
     MAX_JOBS=4 uv pip install -c ~/llm-engine-lab/constraints.txt flash-attn --no-build-isolation
-    source ~/venvs/vllm/bin/activate && python ~/llm-engine-env/test_vllm.py
+    source ~/venvs/vllm/bin/activate && python ~/llm-engine-env/scripts/test_vllm.py
 NEXT
     ;;
 

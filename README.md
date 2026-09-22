@@ -60,7 +60,7 @@ cd ~/llm-engine-env && bash setup_wsl.sh
 
 ```bash
 source ~/venvs/dev/bin/activate
-python ~/llm-engine-env/verify_env.py
+python ~/llm-engine-env/scripts/verify_env.py
 ```
 
 ## 五、几个必踩的坑（提前避）
@@ -122,5 +122,5 @@ python ~/llm-engine-env/verify_env.py
    - `vllm-src/vllm/v1/core/sched/scheduler.py`（连续批处理调度）
    V1 引擎核心是 Python 写的，可读性远好于 V0。
 2. **先写正确，再写快**：先用纯 PyTorch 实现一个正确但慢的版本，建立 baseline 和单元测试。
-3. **再逐层替换**：KV 池化 → 分页 kernel → prefix 复用 → 连续批处理 → CUDA Graph。每一步都用 `verify_env.py` 里的 profiler 量一遍。
+3. **再逐层替换**：KV 池化 → 分页 kernel → prefix 复用 → 连续批处理 → CUDA Graph。每一步都用 `scripts/verify_env.py` 里的 profiler 量一遍。
 4. **对照 vLLM 的行为**：同样请求跑你自己的引擎和 vLLM，比 TTFT / TPOT / 显存占用，差异就是你要学的东西。

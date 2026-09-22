@@ -4,7 +4,7 @@
 
 用法:
     source ~/venvs/dev/bin/activate
-    python verify_env.py
+    python scripts/verify_env.py
 
 逐项检查你后续六块学习内容所依赖的底层能力是否真的可用,
 而不是只看 import 成功 —— 例如 CUDA Graph 在 WSL 下能不能 capture 成功,
