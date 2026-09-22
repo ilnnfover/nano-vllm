@@ -2,7 +2,8 @@
 """本地 benchmark：对指定 backend 逐条测量 TTFT / TPOT / 吞吐。
 
 Backend 统一接口: prefill(prompt_ids) -> last_logits, step(tok) -> last_logits
-（状态由 backend 自持：hf 用 DynamicCache，nano 全量重算）。P1 起两种后端共用同一计时代码。
+（状态由 backend 自持: hf 用 DynamicCache, nano 用自研 KVCache, nano-eager 全量重算）。
+P2 起 nano 默认走 KV cache, nano-eager 保留 P1 eager 路径作对照。
 
 口径定义:
   TTFT  = prefill 一次前向的耗时 (ms)
@@ -21,6 +22,7 @@ import json
 import platform
 import statistics
 import time
+from functools import partial
 from pathlib import Path
 
 import numpy as np
@@ -56,25 +58,36 @@ class HFBackend:
 
 
 class NanoBackend:
-    def __init__(self, model_path: str, device: str, dtype: torch.dtype) -> None:
+    """use_cache=True 走 P2 prefill+decode（KV cache），False 走 P1 eager 全量重算。"""
+
+    def __init__(self, model_path: str, device: str, dtype: torch.dtype, use_cache: bool = True) -> None:
         from nano_vllm.model_executor.runner import NanoRunner
 
         self.runner = NanoRunner(model_path, device=device, dtype=dtype)
         self.device = device
+        self.use_cache = use_cache
         self.ids: list[int] = []
 
     @torch.no_grad()
     def prefill(self, prompt_ids: list[int]) -> torch.Tensor:
+        if self.use_cache:
+            return self.runner._prefill(prompt_ids)
         self.ids = list(prompt_ids)
         return self.runner.forward_last_logits(self.ids)
 
     @torch.no_grad()
     def step(self, tok: int) -> torch.Tensor:
+        if self.use_cache:
+            return self.runner._decode(tok)
         self.ids.append(tok)
         return self.runner.forward_last_logits(self.ids)
 
 
-BACKENDS = {"hf": HFBackend, "nano": NanoBackend}
+BACKENDS = {
+    "hf": HFBackend,
+    "nano": NanoBackend,
+    "nano-eager": partial(NanoBackend, use_cache=False),
+}
 
 
 def run_one(backend, prompt_ids: list[int], output_len: int, device: str) -> dict:

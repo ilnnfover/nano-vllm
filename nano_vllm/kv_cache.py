@@ -48,6 +48,10 @@ class KVCache:
     @torch.no_grad()
     def write(self, layer_idx: int, k: torch.Tensor, v: torch.Tensor, start_pos: int) -> None:
         s = k.shape[2]
+        if start_pos + s > self.max_seq_len:
+            raise ValueError(
+                f"KV cache 溢出: 写入位置 {start_pos}+{s} 超过 max_seq_len={self.max_seq_len}"
+            )
         self.k_cache[layer_idx, :, start_pos : start_pos + s] = k.transpose(1, 2)
         self.v_cache[layer_idx, :, start_pos : start_pos + s] = v.transpose(1, 2)
 
