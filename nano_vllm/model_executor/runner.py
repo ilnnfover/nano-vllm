@@ -105,6 +105,7 @@ class NanoRunner:
     @torch.no_grad()
     def _prefill_paged(self, prompt_ids: list[int]) -> torch.Tensor:
         seq_len = len(prompt_ids)
+        self.paged_cache._written_tokens = 0
         self._block_table = self.paged_cache.allocate(seq_len)
         self._paged_seq_len = seq_len
         slot_mapping = self.paged_cache.slot_mapping(self._block_table, 0, seq_len)

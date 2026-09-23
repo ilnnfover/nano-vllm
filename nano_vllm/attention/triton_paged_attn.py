@@ -53,6 +53,7 @@ def _paged_attn_decode_kernel(
         physical = tl.load(block_table_ptr + blk_i)
         base = physical * block_size * num_kv_heads * head_dim + kv_head_idx * head_dim
         n_mask = (blk_i * block_size + offs_n) < seq_len
+        n_mask = n_mask & (offs_n < block_size)
 
         k_ptrs = k_cache_ptr + base + offs_n[:, None] * (num_kv_heads * head_dim) + offs_d[None, :]
         k = tl.load(k_ptrs, mask=n_mask[:, None] & d_mask[None, :], other=0.0)
