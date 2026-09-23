@@ -10,6 +10,8 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
+from nano_vllm.attention.backend import get_paged_attn
+from nano_vllm.attention.metadata import AttentionMetadata
 from nano_vllm.config import Qwen2Config
 
 
@@ -81,6 +83,63 @@ class Attention(nn.Module):
         self.v_proj = nn.Linear(config.hidden_size, config.num_key_value_heads * config.head_dim, bias=True)
         self.o_proj = nn.Linear(config.num_attention_heads * config.head_dim, config.hidden_size, bias=False)
 
+    def _sdpa(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        attn_mask: torch.Tensor | None,
+        is_causal: bool,
+    ) -> torch.Tensor:
+        """SDPA 封装：CUDA + GQA + head_dim<=256 时走 enable_gqa 融合，否则手动 repeat_kv。"""
+        if self.num_kv_groups > 1 and q.is_cuda and self.head_dim <= 256:
+            return F.scaled_dot_product_attention(
+                q, k, v, attn_mask=attn_mask,
+                scale=self.scaling, is_causal=is_causal, enable_gqa=True,
+            )
+        k = repeat_kv(k, self.num_kv_groups)
+        v = repeat_kv(v, self.num_kv_groups)
+        return F.scaled_dot_product_attention(
+            q, k, v, attn_mask=attn_mask,
+            scale=self.scaling, is_causal=is_causal,
+        )
+
+    def _forward_paged(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        paged_cache,
+        layer_idx: int,
+        metadata: AttentionMetadata | None,
+        b: int,
+        s: int,
+    ) -> torch.Tensor:
+        """P3 分页路径（单条 b=1）。
+
+        prefill: K/V 按 slot_mapping 写入物理块，attention 用当前 chunk + SDPA is_causal=True
+        decode:  新 K/V 写入物理块，attention 用 block_table 间接寻址读全部历史 KV
+        """
+        if metadata is None:
+            raise ValueError("分页路径必须传 AttentionMetadata")
+        if b != 1:
+            raise ValueError(f"P3 分页路径只支持单条 b=1, got b={b}")
+        paged_cache.write(layer_idx, k[0], v[0], metadata.slot_mapping)
+        if metadata.is_prefill:
+            out = self._sdpa(q, k, v, attn_mask=None, is_causal=True)
+        else:
+            attn_fn = get_paged_attn(metadata.attn_impl)
+            out = attn_fn(
+                q[0],
+                paged_cache.k_cache[layer_idx],
+                paged_cache.v_cache[layer_idx],
+                metadata.block_table,
+                metadata.seq_len,
+                self.num_kv_heads,
+                self.scaling,
+            ).unsqueeze(0)
+        return self.o_proj(out.transpose(1, 2).reshape(b, s, -1))
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -90,6 +149,8 @@ class Attention(nn.Module):
         is_prefill: bool = True,
         cache_seq_len: int = 0,
         attn_mask: torch.Tensor | None = None,
+        paged_cache=None,
+        metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
         b, s, _ = hidden_states.shape
         q = self.q_proj(hidden_states).view(b, s, self.num_heads, self.head_dim).transpose(1, 2)
@@ -99,6 +160,10 @@ class Attention(nn.Module):
         cos, sin = position_embeddings
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
+        if paged_cache is not None:
+            return self._forward_paged(q, k, v, paged_cache, layer_idx, metadata, b, s)
+
+        # ---- P2 连续 cache 路径（对拍基线，保持原逻辑）----
         if kv_cache is not None:
             kv_cache.write(layer_idx, k, v, cache_seq_len)
             total_len = cache_seq_len + s
@@ -111,19 +176,7 @@ class Attention(nn.Module):
 
         use_mask = attn_mask is not None
         is_causal = is_prefill and not use_mask
-
-        if self.num_kv_groups > 1 and q.is_cuda and self.head_dim <= 256:
-            out = F.scaled_dot_product_attention(
-                q, k_attn, v_attn, attn_mask=attn_mask,
-                scale=self.scaling, is_causal=is_causal, enable_gqa=True,
-            )
-        else:
-            k_attn = repeat_kv(k_attn, self.num_kv_groups)
-            v_attn = repeat_kv(v_attn, self.num_kv_groups)
-            out = F.scaled_dot_product_attention(
-                q, k_attn, v_attn, attn_mask=attn_mask,
-                scale=self.scaling, is_causal=is_causal,
-            )
+        out = self._sdpa(q, k_attn, v_attn, attn_mask, is_causal)
         out = out.transpose(1, 2).reshape(b, s, -1)
         return self.o_proj(out)
 
@@ -157,6 +210,8 @@ class DecoderLayer(nn.Module):
         is_prefill: bool = True,
         cache_seq_len: int = 0,
         attn_mask: torch.Tensor | None = None,
+        paged_cache=None,
+        metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -164,7 +219,7 @@ class DecoderLayer(nn.Module):
             hidden_states, position_embeddings,
             kv_cache=kv_cache, layer_idx=layer_idx,
             is_prefill=is_prefill, cache_seq_len=cache_seq_len,
-            attn_mask=attn_mask,
+            attn_mask=attn_mask, paged_cache=paged_cache, metadata=metadata,
         )
         hidden_states = residual + hidden_states
 
@@ -192,6 +247,8 @@ class Qwen2Model(nn.Module):
         cache_seq_len: int = 0,
         attn_mask: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
+        paged_cache=None,
+        metadata: AttentionMetadata | None = None,
     ):
         b, s = input_ids.shape
         if position_ids is None:
@@ -206,7 +263,7 @@ class Qwen2Model(nn.Module):
                 hidden_states, position_embeddings,
                 kv_cache=kv_cache, layer_idx=layer_idx,
                 is_prefill=is_prefill, cache_seq_len=cache_seq_len,
-                attn_mask=attn_mask,
+                attn_mask=attn_mask, paged_cache=paged_cache, metadata=metadata,
             )
             if output_hidden_states:
                 all_hidden.append(hidden_states)
@@ -236,12 +293,15 @@ class Qwen2ForCausalLM(nn.Module):
         attn_mask: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
         last_idx: torch.Tensor | None = None,
+        paged_cache=None,
+        metadata: AttentionMetadata | None = None,
     ):
         hidden_states, all_hidden = self.model(
             input_ids, output_hidden_states,
             kv_cache=kv_cache, is_prefill=is_prefill,
             cache_seq_len=cache_seq_len, attn_mask=attn_mask,
             position_ids=position_ids,
+            paged_cache=paged_cache, metadata=metadata,
         )
         if last_idx is not None:
             b = hidden_states.shape[0]
