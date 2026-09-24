@@ -37,12 +37,14 @@ class NanoRunner:
         block_size: int = 16,
         num_blocks: int | None = None,
         attn_impl: str = "torch",
+        prefill_impl: str = "torch",
     ) -> None:
         self.model_path = model_path
         self.device = device
         self.dtype = dtype
         self.block_size = block_size
         self.attn_impl = attn_impl
+        self.prefill_impl = prefill_impl
         self.config = Qwen2Config.from_json(Path(model_path) / "config.json")
         self.model = Qwen2ForCausalLM(self.config).to(device=device, dtype=dtype).eval()
         self.model.load_weights(model_path)

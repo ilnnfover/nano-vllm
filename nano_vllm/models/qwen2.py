@@ -12,6 +12,7 @@ import torch.nn.functional as F
 
 from nano_vllm.attention.backend import get_paged_attn
 from nano_vllm.attention.metadata import AttentionMetadata
+from nano_vllm.attention.varlen_prefill import varlen_prefill_attention
 from nano_vllm.config import Qwen2Config
 
 
@@ -131,7 +132,23 @@ class Attention(nn.Module):
                           v[0] if b == 1 else v.squeeze(2).transpose(0, 1),
                           metadata.slot_mapping)
         if metadata.is_prefill:
-            if metadata.seq_len > s:
+            if metadata.qo_indptr is not None:
+                # P4 varlen 拼批 prefill: flat 拼接多条请求，一次算完
+                q_flat = q[0].transpose(0, 1).contiguous()  # [total_q, num_heads, head_dim]
+                out_flat = varlen_prefill_attention(
+                    q_flat,
+                    paged_cache.k_cache[layer_idx],
+                    paged_cache.v_cache[layer_idx],
+                    metadata.qo_indptr,
+                    metadata.paged_kv_indptr,
+                    metadata.paged_kv_indices,
+                    metadata.paged_kv_last_page_len,
+                    self.num_kv_heads,
+                    self.scaling,
+                    impl=metadata.attn_impl,
+                )
+                out = out_flat.transpose(0, 1).unsqueeze(0)  # [1, num_heads, total_q, head_dim]
+            elif metadata.seq_len > s:
                 k_all, v_all = paged_cache.read_blocks(layer_idx, metadata.block_table)
                 k_all = k_all[:, :metadata.seq_len, :].unsqueeze(0)
                 v_all = v_all[:, :metadata.seq_len, :].unsqueeze(0)

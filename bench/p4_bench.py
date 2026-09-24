@@ -43,11 +43,12 @@ def sync(device: str) -> None:
         torch.cuda.synchronize()
 
 
-def make_runner(model: str, num_blocks: int, max_seq_len: int, device: str, dtype: torch.dtype) -> NanoRunner:
+def make_runner(model: str, num_blocks: int, max_seq_len: int, device: str, dtype: torch.dtype, prefill_impl: str = "torch") -> NanoRunner:
     return NanoRunner(
         model, device=device, dtype=dtype,
         max_seq_len=max_seq_len, block_size=16, num_blocks=num_blocks,
         attn_impl="torch",
+        prefill_impl=prefill_impl,
     )
 
 
@@ -144,7 +145,7 @@ def bench_throughput(args) -> dict:
     max_seq_len = max(lengths) + args.max_new_tokens
     num_blocks = (sum(lengths) + args.num_requests * args.max_new_tokens) // 16 + 32
 
-    runner = make_runner(args.model, num_blocks, max_seq_len, device, dtype)
+    runner = make_runner(args.model, num_blocks, max_seq_len, device, dtype, args.prefill_impl)
 
     results = {}
     results["p4_continuous"] = run_p4_continuous(
@@ -184,7 +185,7 @@ def bench_tpot(args) -> dict:
 
     results = {}
     for label, budget in [("chunked_512", 512), ("non_chunked_65536", 65536)]:
-        runner = make_runner(args.model, num_blocks, max_seq_len, device, dtype)
+        runner = make_runner(args.model, num_blocks, max_seq_len, device, dtype, args.prefill_impl)
         runner.paged_cache.reset()
         engine = make_engine(runner, budget)
         params = SamplingParams(temperature=0.0, max_new_tokens=args.max_new_tokens)
@@ -212,6 +213,7 @@ def main() -> None:
     p.add_argument("--num-requests", type=int, default=12)
     p.add_argument("--max-new-tokens", type=int, default=64)
     p.add_argument("--budget", type=int, default=2048, help="max_num_batched_tokens")
+    p.add_argument("--prefill-impl", default="torch", choices=["torch", "flashinfer"], help="prefill attention 后端")
     p.add_argument("--tpot-test", action="store_true", help="跑 TPOT p99 对比测试")
     p.add_argument("--tag", default=None)
     p.add_argument("--results-dir", default="bench/results")

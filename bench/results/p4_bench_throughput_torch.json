@@ -1,0 +1,21 @@
+{
+  "p4_continuous": {
+    "wall_ms": 16520.0689350022,
+    "output_tokens": 768,
+    "throughput_tok_s": 46.48891012632434,
+    "num_requests": 12,
+    "max_num_batched_tokens": 2048
+  },
+  "p3_static": {
+    "wall_ms": 46837.4380650057,
+    "output_tokens": 768,
+    "throughput_tok_s": 16.397139376711692,
+    "num_requests": 12,
+    "padding_waste_rate": 0.6149870801033592
+  },
+  "throughput_ratio": 2.8351841780616307,
+  "target": ">= 2.0x",
+  "pass": true,
+  "model": "models/Qwen2.5-1.5B-Instruct",
+  "dtype": "bf16"
+}

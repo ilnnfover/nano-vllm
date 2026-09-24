@@ -12,6 +12,7 @@ from __future__ import annotations
 import torch
 
 from nano_vllm.attention.metadata import AttentionMetadata
+from nano_vllm.attention.varlen_prefill import build_paged_kv_metadata
 from nano_vllm.engine.scheduler import Scheduler, SchedulerOutput
 from nano_vllm.engine.sequence import Sequence, SamplingParams
 from nano_vllm.model_executor.runner import NanoRunner
@@ -57,11 +58,12 @@ class EngineCore:
         prefill_seqs = [s for s in scheduler_output.scheduled if s.is_prefill]
         decode_seqs = [s for s in scheduler_output.scheduled if not s.is_prefill]
 
-        for s in prefill_seqs:
-            seq = s.seq
-            logits = self._run_prefill(seq, s.num_tokens)
-            if s.is_last_prefill_chunk:
-                sampled[seq.seq_id] = self._sample(seq, logits)
+        if prefill_seqs:
+            logits_map = self._run_prefill_batched(prefill_seqs)
+            for s in prefill_seqs:
+                if s.is_last_prefill_chunk:
+                    seq = s.seq
+                    sampled[seq.seq_id] = self._sample(seq, logits_map[seq.seq_id])
 
         if len(decode_seqs) == 1:
             seq = decode_seqs[0].seq
@@ -111,6 +113,65 @@ class EngineCore:
             position_ids=position_ids,
         )
         return logits[0, -1]
+
+    @torch.no_grad()
+    def _run_prefill_batched(self, scheduled_prefills) -> dict[int, torch.Tensor]:
+        """varlen 拼批 prefill：多条请求的 chunk 扁平拼接，一次 model forward。
+
+        Returns:
+            {seq_id: last_token_logits}，仅含产生输出的请求（last prefill chunk）
+        """
+        seqs = [s.seq for s in scheduled_prefills]
+        num_tokens_list = [s.num_tokens for s in scheduled_prefills]
+
+        input_ids: list[int] = []
+        position_ids: list[int] = []
+        slot_mappings: list[torch.Tensor] = []
+        qo_indptr = [0]
+        block_tables: list[list[int]] = []
+        kv_lens: list[int] = []
+
+        for seq, num_tokens in zip(seqs, num_tokens_list):
+            chunk_start = seq.num_computed_tokens
+            chunk_ids = seq.prompt_token_ids[chunk_start : chunk_start + num_tokens]
+            input_ids.extend(chunk_ids)
+            position_ids.extend(range(chunk_start, chunk_start + num_tokens))
+            slot_mappings.append(self.runner.paged_cache.slot_mapping(
+                seq.block_table, chunk_start, num_tokens
+            ))
+            qo_indptr.append(qo_indptr[-1] + num_tokens)
+            block_tables.append(seq.block_table)
+            kv_lens.append(chunk_start + num_tokens)
+
+        input_ids_t = torch.tensor([input_ids], dtype=torch.long, device=self.device)
+        position_ids_t = torch.tensor([position_ids], device=self.device)
+        slot_mapping = torch.cat(slot_mappings)
+        qo_indptr_t = torch.tensor(qo_indptr, dtype=torch.int32, device=self.device)
+        paged_kv_indptr, paged_kv_indices, paged_kv_last_page_len = build_paged_kv_metadata(
+            block_tables, kv_lens, self.runner.paged_cache.block_size, self.device,
+        )
+        metadata = AttentionMetadata(
+            is_prefill=True,
+            slot_mapping=slot_mapping,
+            qo_indptr=qo_indptr_t,
+            paged_kv_indptr=paged_kv_indptr,
+            paged_kv_indices=paged_kv_indices,
+            paged_kv_last_page_len=paged_kv_last_page_len,
+            attn_impl=self.runner.prefill_impl,
+        )
+        # 只取每条请求最后一个 token 的 logits（避免算全部 [total_q, vocab]）
+        last_idx = torch.tensor(
+            [qo_indptr[i + 1] - 1 for i in range(len(seqs))],
+            dtype=torch.long, device=self.device,
+        )
+        logits, _ = self.runner.model(
+            input_ids_t,
+            paged_cache=self.runner.paged_cache,
+            metadata=metadata,
+            position_ids=position_ids_t,
+            last_idx=last_idx,
+        )
+        return {seq.seq_id: logits[i] for i, seq in enumerate(seqs)}
 
     @torch.no_grad()
     def _run_decode(self, seq: Sequence) -> torch.Tensor:

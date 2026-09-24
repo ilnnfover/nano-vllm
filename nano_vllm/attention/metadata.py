@@ -14,7 +14,7 @@ import torch
 
 @dataclass
 class AttentionMetadata:
-    """分页路径的 attention 元数据（P3 单条 + P4 批量 decode）。"""
+    """分页路径的 attention 元数据（P3 单条 + P4 批量 decode + P4 varlen prefill）。"""
 
     is_prefill: bool = True
     slot_mapping: torch.Tensor | None = None
@@ -24,3 +24,10 @@ class AttentionMetadata:
     # P4 批量 decode: 多条序列各自的 block_table 和 seq_len
     block_tables: list[list[int]] | None = None
     seq_lens: list[int] | None = None
+    # P4 varlen prefill 拼批: flat 拼接多条请求的 prefill chunk
+    # qo_indptr: [batch+1] query 累计长度；paged_kv_indptr: [batch+1] KV block 累计数
+    # paged_kv_indices: 所有请求物理 block 拼接；paged_kv_last_page_len: [batch] 末块有效长度
+    qo_indptr: torch.Tensor | None = None
+    paged_kv_indptr: torch.Tensor | None = None
+    paged_kv_indices: torch.Tensor | None = None
+    paged_kv_last_page_len: torch.Tensor | None = None
