@@ -14,15 +14,13 @@ import torch
 
 @dataclass
 class AttentionMetadata:
-    """单条分页路径的 attention 元数据（P3 decode/prefill 共用）。"""
+    """分页路径的 attention 元数据（P3 单条 + P4 批量 decode）。"""
 
-    # prefill 走 SDPA is_causal=True；decode 走 paged attention
     is_prefill: bool = True
-    # 当前步 token 的物理写入位置 [num_tokens]（reshape_and_cache 用）
     slot_mapping: torch.Tensor | None = None
-    # 逻辑块 → 物理块编号（decode 读 KV 用）
     block_table: list[int] | None = None
-    # 该序列当前 KV 总长度（decode attention 的 softmax 范围）
     seq_len: int = 0
-    # decode attention 后端: "torch"（朴素对照）| "triton"（自研 kernel）
     attn_impl: str = "torch"
+    # P4 批量 decode: 多条序列各自的 block_table 和 seq_len
+    block_tables: list[list[int]] | None = None
+    seq_lens: list[int] | None = None

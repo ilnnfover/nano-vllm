@@ -115,33 +115,60 @@ class Attention(nn.Module):
         b: int,
         s: int,
     ) -> torch.Tensor:
-        """P3 分页路径（单条 b=1）。
+        """P3/P4 分页路径（单条 b=1）。
 
-        prefill: K/V 按 slot_mapping 写入物理块，attention 用当前 chunk + SDPA is_causal=True
-        decode:  新 K/V 写入物理块，attention 用 block_table 间接寻址读全部历史 KV
+        prefill 首块: K/V 写入物理块，SDPA is_causal=True
+        prefill 续块 (P4 chunked): K/V 写入物理块，读全部 KV（历史+当前），混合 mask
+        decode:  新 K/V 写入物理块，block_table 间接寻址读全部历史 KV
         """
         if metadata is None:
             raise ValueError("分页路径必须传 AttentionMetadata")
-        if b != 1:
-            raise ValueError(f"P3 分页路径只支持单条 b=1, got b={b}")
-        if metadata.is_prefill and metadata.seq_len > s:
-            raise NotImplementedError(
-                "P3 分页路径暂不支持 chunked prefill（历史 KV + 当前 chunk 混合 mask），留给 P4"
-            )
-        paged_cache.write(layer_idx, k[0], v[0], metadata.slot_mapping)
+        if metadata.is_prefill and b > 1:
+            raise ValueError(f"分页 prefill 暂只支持 b=1, got b={b}")
+        if not metadata.is_prefill and b > 1 and metadata.block_tables is None:
+            raise ValueError("批量 decode 必须传 block_tables")
+        paged_cache.write(layer_idx, k[0] if b == 1 else k.squeeze(2).transpose(0, 1),
+                          v[0] if b == 1 else v.squeeze(2).transpose(0, 1),
+                          metadata.slot_mapping)
         if metadata.is_prefill:
-            out = self._sdpa(q, k, v, attn_mask=None, is_causal=True)
+            if metadata.seq_len > s:
+                k_all, v_all = paged_cache.read_blocks(layer_idx, metadata.block_table)
+                k_all = k_all[:, :metadata.seq_len, :].unsqueeze(0)
+                v_all = v_all[:, :metadata.seq_len, :].unsqueeze(0)
+                cache_seq_len = metadata.seq_len - s
+                mask = torch.zeros(s, metadata.seq_len, device=q.device, dtype=q.dtype)
+                mask[:, cache_seq_len:] = torch.triu(
+                    torch.full((s, s), float("-inf"), device=q.device, dtype=q.dtype),
+                    diagonal=1,
+                )
+                out = self._sdpa(q, k_all, v_all, attn_mask=mask.unsqueeze(0).unsqueeze(0), is_causal=False)
+            else:
+                out = self._sdpa(q, k, v, attn_mask=None, is_causal=True)
         else:
             attn_fn = get_paged_attn(metadata.attn_impl)
-            out = attn_fn(
-                q[0],
-                paged_cache.k_cache[layer_idx],
-                paged_cache.v_cache[layer_idx],
-                metadata.block_table,
-                metadata.seq_len,
-                self.num_kv_heads,
-                self.scaling,
-            ).unsqueeze(0)
+            if b == 1:
+                out = attn_fn(
+                    q[0],
+                    paged_cache.k_cache[layer_idx],
+                    paged_cache.v_cache[layer_idx],
+                    metadata.block_table,
+                    metadata.seq_len,
+                    self.num_kv_heads,
+                    self.scaling,
+                ).unsqueeze(0)
+            else:
+                outs = []
+                for i in range(b):
+                    outs.append(attn_fn(
+                        q[i],
+                        paged_cache.k_cache[layer_idx],
+                        paged_cache.v_cache[layer_idx],
+                        metadata.block_tables[i],
+                        metadata.seq_lens[i],
+                        self.num_kv_heads,
+                        self.scaling,
+                    ))
+                out = torch.stack(outs)
         return self.o_proj(out.transpose(1, 2).reshape(b, s, -1))
 
     def forward(
