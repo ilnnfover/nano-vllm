@@ -124,6 +124,10 @@ class Attention(nn.Module):
             raise ValueError("分页路径必须传 AttentionMetadata")
         if b != 1:
             raise ValueError(f"P3 分页路径只支持单条 b=1, got b={b}")
+        if metadata.is_prefill and metadata.seq_len > s:
+            raise NotImplementedError(
+                "P3 分页路径暂不支持 chunked prefill（历史 KV + 当前 chunk 混合 mask），留给 P4"
+            )
         paged_cache.write(layer_idx, k[0], v[0], metadata.slot_mapping)
         if metadata.is_prefill:
             out = self._sdpa(q, k, v, attn_mask=None, is_causal=True)
@@ -167,7 +171,17 @@ class Attention(nn.Module):
         if kv_cache is not None:
             kv_cache.write(layer_idx, k, v, cache_seq_len)
             total_len = cache_seq_len + s
-            if is_prefill:
+            if is_prefill and cache_seq_len > 0:
+                # P0-01 修复: chunked prefill 续段——读全部 KV，构造混合 mask
+                # 历史 KV 全可见 + 当前 chunk 内 causal
+                k_attn, v_attn = kv_cache.read(layer_idx, total_len)
+                chunk_mask = torch.zeros(s, total_len, device=q.device, dtype=q.dtype)
+                chunk_mask[:, cache_seq_len:] = torch.triu(
+                    torch.full((s, s), float("-inf"), device=q.device, dtype=q.dtype),
+                    diagonal=1,
+                )
+                attn_mask = chunk_mask.unsqueeze(0).unsqueeze(0)
+            elif is_prefill:
                 k_attn, v_attn = k, v
             else:
                 k_attn, v_attn = kv_cache.read(layer_idx, total_len)
@@ -175,7 +189,7 @@ class Attention(nn.Module):
             k_attn, v_attn = k, v
 
         use_mask = attn_mask is not None
-        is_causal = is_prefill and not use_mask
+        is_causal = is_prefill and cache_seq_len == 0 and not use_mask
         out = self._sdpa(q, k_attn, v_attn, attn_mask, is_causal)
         out = out.transpose(1, 2).reshape(b, s, -1)
         return self.o_proj(out)
