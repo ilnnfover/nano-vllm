@@ -1,0 +1,1 @@
+"""P5 · 最小 Serving：async 引擎 + FastAPI OpenAI 兼容 API。"""

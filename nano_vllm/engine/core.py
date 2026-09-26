@@ -45,12 +45,14 @@ class EngineCore:
         self.scheduler.add_request(seq)
         return seq
 
-    def step(self) -> list[Sequence]:
+    def step(self) -> tuple[list[Sequence], dict[int, int]]:
+        """执行一次调度+前向，返回 (完成的 sequences, 本步产出的 {seq_id: token_id})。"""
         if not self.scheduler.has_requests():
-            return []
+            return [], {}
         scheduler_output = self.scheduler.schedule()
         sampled = self._execute(scheduler_output)
-        return self.scheduler.update_from_output(scheduler_output, sampled)
+        finished = self.scheduler.update_from_output(scheduler_output, sampled)
+        return finished, sampled
 
     def _execute(self, scheduler_output: SchedulerOutput) -> dict[int, int]:
         """执行模型前向，返回 {seq_id: sampled_token_id}。"""
@@ -245,7 +247,7 @@ class EngineCore:
         seqs = [self.add_request(p, sampling_params) for p in prompts]
         outputs: dict[int, list[int]] = {}
         while self.scheduler.has_requests():
-            finished = self.step()
+            finished, _ = self.step()
             for seq in finished:
                 outputs[seq.seq_id] = seq.output_token_ids
         return [outputs[seq.seq_id] for seq in seqs]
