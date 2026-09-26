@@ -128,8 +128,19 @@ def make_mixed_prompts(tokenizer, lengths: list[int]) -> list[list[int]]:
     return prompts
 
 
+def _aggregate(runs: list[dict], key: str) -> dict:
+    """聚合 repeat 次运行的某个指标，返回 median/min/max/all。"""
+    vals = sorted(r[key] for r in runs)
+    return {
+        "median": float(np.median(vals)),
+        "min": float(vals[0]),
+        "max": float(vals[-1]),
+        "all": [float(v) for v in vals],
+    }
+
+
 def bench_throughput(args) -> dict:
-    """吞吐对比：P4 连续批 vs P3 静态批。"""
+    """吞吐对比：P4 连续批 vs P3 静态批（warmup + repeat 取中位数）。"""
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     dtype = {"bf16": torch.bfloat16, "fp32": torch.float32}[args.dtype]
 
@@ -147,28 +158,49 @@ def bench_throughput(args) -> dict:
 
     runner = make_runner(args.model, num_blocks, max_seq_len, device, dtype, args.prefill_impl)
 
-    results = {}
-    results["p4_continuous"] = run_p4_continuous(
-        runner, prompts, args.max_new_tokens, args.budget,
-    )
-    results["p3_static"] = run_p3_static(
-        runner, prompts, args.max_new_tokens,
-    )
+    # warmup（结果丢弃，消除 Triton JIT 编译 + CUDA context 冷启动）
+    for _ in range(args.warmup):
+        run_p4_continuous(runner, prompts, args.max_new_tokens, args.budget)
+        run_p3_static(runner, prompts, args.max_new_tokens)
 
-    p4_t = results["p4_continuous"]["throughput_tok_s"]
-    p3_t = results["p3_static"]["throughput_tok_s"]
-    results["throughput_ratio"] = p4_t / p3_t if p3_t > 0 else 0
-    results["target"] = ">= 2.0x"
-    results["pass"] = results["throughput_ratio"] >= 2.0
+    # 正式测量：repeat 次取中位数
+    p4_runs = [run_p4_continuous(runner, prompts, args.max_new_tokens, args.budget) for _ in range(args.repeat)]
+    p3_runs = [run_p3_static(runner, prompts, args.max_new_tokens) for _ in range(args.repeat)]
 
-    return results
+    p4_agg = _aggregate(p4_runs, "throughput_tok_s")
+    p3_agg = _aggregate(p3_runs, "throughput_tok_s")
+    p4_wall = _aggregate(p4_runs, "wall_ms")
+    p3_wall = _aggregate(p3_runs, "wall_ms")
+
+    ratio = p4_agg["median"] / p3_agg["median"] if p3_agg["median"] > 0 else 0
+    return {
+        "p4_continuous": {
+            "throughput_tok_s": p4_agg,
+            "wall_ms": p4_wall,
+            "output_tokens": p4_runs[0]["output_tokens"],
+            "num_requests": len(prompts),
+            "max_num_batched_tokens": args.budget,
+        },
+        "p3_static": {
+            "throughput_tok_s": p3_agg,
+            "wall_ms": p3_wall,
+            "output_tokens": p3_runs[0]["output_tokens"],
+            "num_requests": len(prompts),
+            "padding_waste_rate": p3_runs[0]["padding_waste_rate"],
+        },
+        "throughput_ratio": ratio,
+        "target": ">= 2.0x",
+        "pass": ratio >= 2.0,
+        "warmup": args.warmup,
+        "repeat": args.repeat,
+    }
 
 
 def bench_tpot(args) -> dict:
     """TPOT p99 对比：chunked prefill (budget=512) vs non-chunked (budget=65536)。
 
-    场景: 4 个短请求 (128 prompt) 先 decode，然后 1 个 8K prompt 提交。
-    测量短请求在长 prefill 期间的 TPOT p99。
+    手动展开 step 循环，记录每个纯 decode step 的间隔（排除 prefill step），
+    取 p99 作为 TPOT 近似。warmup 用单独 engine 实例预热 kernel。
     """
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     dtype = {"bf16": torch.bfloat16, "fp32": torch.float32}[args.dtype]
@@ -186,22 +218,56 @@ def bench_tpot(args) -> dict:
     results = {}
     for label, budget in [("chunked_512", 512), ("non_chunked_65536", 65536)]:
         runner = make_runner(args.model, num_blocks, max_seq_len, device, dtype, args.prefill_impl)
+
+        # warmup：单独 engine 跑短请求预热 kernel，不消耗正式测量额度
+        for _ in range(args.warmup):
+            runner.paged_cache.reset()
+            we = make_engine(runner, budget)
+            wp = SamplingParams(temperature=0.0, max_new_tokens=4)
+            we.generate(make_mixed_prompts(tokenizer, [128]), wp)
+
+        # 正式测量：手动 step 循环，记录纯 decode step 间隔
         runner.paged_cache.reset()
         engine = make_engine(runner, budget)
         params = SamplingParams(temperature=0.0, max_new_tokens=args.max_new_tokens)
+        seqs = [engine.add_request(p, params) for p in all_prompts]
 
+        decode_intervals: list[float] = []
+        prev_t: float | None = None
         sync(runner.device)
         t0 = time.perf_counter()
-        outs = engine.generate(all_prompts, params)
-        sync(runner.device)
+        while engine.scheduler.has_requests():
+            sched = engine.scheduler.schedule()
+            has_prefill = any(s.is_prefill for s in sched.scheduled)
+            sampled = engine._execute(sched)
+            engine.scheduler.update_from_output(sched, sampled)
+            sync(runner.device)
+            t_now = time.perf_counter()
+            if prev_t is not None and not has_prefill:
+                decode_intervals.append((t_now - prev_t) * 1e3)
+            prev_t = t_now
         wall_ms = (time.perf_counter() - t0) * 1e3
+
+        out_tokens = sum(len(s.output_token_ids) for s in seqs)
+        tpot_p99 = float(np.percentile(decode_intervals, 99)) if decode_intervals else 0.0
+        tpot_p50 = float(np.percentile(decode_intervals, 50)) if decode_intervals else 0.0
 
         results[label] = {
             "wall_ms": wall_ms,
             "budget": budget,
-            "output_tokens": sum(len(o) for o in outs),
+            "output_tokens": out_tokens,
+            "tpot_p50_ms": tpot_p50,
+            "tpot_p99_ms": tpot_p99,
+            "num_decode_steps": len(decode_intervals),
         }
 
+    results["warmup"] = args.warmup
+    results["tpot_ratio_p99"] = (
+        results["chunked_512"]["tpot_p99_ms"] / results["non_chunked_65536"]["tpot_p99_ms"]
+        if results["non_chunked_65536"]["tpot_p99_ms"] > 0 else 0
+    )
+    results["target"] = "chunked p99 < 2× non_chunked p99"
+    results["pass"] = results["tpot_ratio_p99"] < 2.0
     return results
 
 
@@ -214,6 +280,8 @@ def main() -> None:
     p.add_argument("--max-new-tokens", type=int, default=64)
     p.add_argument("--budget", type=int, default=2048, help="max_num_batched_tokens")
     p.add_argument("--prefill-impl", default="torch", choices=["torch", "flashinfer"], help="prefill attention 后端")
+    p.add_argument("--warmup", type=int, default=1, help="预热轮数（结果丢弃，消除 Triton JIT 冷启动）")
+    p.add_argument("--repeat", type=int, default=3, help="测量轮数（取中位数消除运行间方差）")
     p.add_argument("--tpot-test", action="store_true", help="跑 TPOT p99 对比测试")
     p.add_argument("--tag", default=None)
     p.add_argument("--results-dir", default="bench/results")
