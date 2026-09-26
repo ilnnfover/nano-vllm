@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>nano-vLLM P0–P4 性能演进</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, "Segoe UI", Roboto, "Noto Sans SC", sans-serif;
+         background: #0d1117; color: #c9d1d9; padding: 24px; max-width: 1200px; margin: 0 auto; }
+  h1 { color: #58a6ff; margin-bottom: 8px; font-size: 28px; }
+  .subtitle { color: #8b949e; margin-bottom: 32px; font-size: 14px; }
+  h2 { color: #79c0ff; margin: 32px 0 12px; font-size: 20px; border-bottom: 1px solid #21262d; padding-bottom: 8px; }
+  .chart-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; margin-bottom: 16px; }
+  .chart-box { background: #161b22; border: 1px solid #21262d; border-radius: 8px; padding: 16px; }
+  .chart-box canvas { max-height: 300px; }
+  .full { grid-column: 1 / -1; }
+  table { width: 100%; border-collapse: collapse; margin-bottom: 24px; font-size: 13px; }
+  th, td { padding: 10px 12px; text-align: left; border-bottom: 1px solid #21262d; }
+  th { color: #58a6ff; font-weight: 600; }
+  td { color: #c9d1d9; }
+  tr:hover { background: #161b22; }
+  .tag { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; }
+  .tag-green { background: #1a7f37; color: #fff; }
+  .tag-blue { background: #1f6feb; color: #fff; }
+  .tag-yellow { background: #9e6a03; color: #fff; }
+  .tag-gray { background: #6e7681; color: #fff; }
+  .note { color: #8b949e; font-size: 12px; margin-top: 4px; }
+  .card { background: #161b22; border: 1px solid #21262d; border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+  .card h3 { color: #79c0ff; font-size: 15px; margin-bottom: 8px; }
+  .card p { color: #b0b8c4; font-size: 13px; line-height: 1.6; }
+  .metric { color: #7ee787; font-weight: 600; }
+</style>
+</head>
+<body>
+<h1>nano-vLLM 性能演进：P0 → P4</h1>
+<p class="subtitle">RTX 4070 Ti SUPER 16GB · bf16 · Qwen2.5-1.5B-Instruct · 2026-09-20 ~ 09-26</p>
+
+<!-- 阶段优化总览 -->
+<h2>各阶段优化总览</h2>
+<table>
+  <tr>
+    <th>阶段</th><th>核心优化</th><th>关键指标</th><th>验收</th>
+  </tr>
+  <tr>
+    <td><span class="tag tag-gray">P0</span></td>
+    <td>golden 工具链 + 统一 bench 框架 + 环境自检</td>
+    <td>env 17/17 全过</td>
+    <td><span class="tag tag-green">PASS</span></td>
+  </tr>
+  <tr>
+    <td><span class="tag tag-gray">P1</span></td>
+    <td>自研 Qwen2 模型（RoPE/RMSNorm/attention 照抄 HF）</td>
+    <td>0.5B 位级一致 + 1.5B fp32 对拍 PASS</td>
+    <td><span class="tag tag-green">PASS</span></td>
+  </tr>
+  <tr>
+    <td><span class="tag tag-blue">P2</span></td>
+    <td>KV cache + prefill/decode 分离 + 静态批</td>
+    <td>TPOT 35.3→21.6ms (<span class="metric">1.64×</span>) · 吞吐 25.0→45.6 tok/s</td>
+    <td><span class="tag tag-green">PASS</span></td>
+  </tr>
+  <tr>
+    <td><span class="tag tag-blue">P3</span></td>
+    <td>PagedAttention（分页 KV cache）+ 自研 Triton decode kernel</td>
+    <td>KV waste 15%→<span class="metric">1.44%</span> · Triton vs torch <span class="metric">1.51×</span> · 32K decode 77.8ms</td>
+    <td><span class="tag tag-green">PASS</span></td>
+  </tr>
+  <tr>
+    <td><span class="tag tag-yellow">P4</span></td>
+    <td>连续批处理（迭代级调度+抢占）+ varlen prefill 拼批</td>
+    <td>吞吐 vs P3 静态批 <span class="metric">2.85×</span>(torch) / <span class="metric">2.92×</span>(flashinfer)</td>
+    <td><span class="tag tag-green">PASS</span></td>
+  </tr>
+</table>
+
+<!-- 图表区 -->
+<h2>性能对比图表</h2>
+
+<div class="chart-grid">
+  <!-- 图1: P2 TPOT 对比 -->
+  <div class="chart-box">
+    <h3>P2 · KV cache 效果：TPOT 降低</h3>
+    <canvas id="p2tpot"></canvas>
+    <p class="note">单请求 · decode 步口径 · eager 无 cache vs cache 复用</p>
+  </div>
+
+  <!-- 图2: P2 吞吐对比 -->
+  <div class="chart-box">
+    <h3>P2 · 静态批吞吐（batch size 扫描）</h3>
+    <canvas id="p2throughput"></canvas>
+    <p class="note">16 请求 short+medium · batch=16 时 padding 浪费 41%</p>
+  </div>
+
+  <!-- 图3: P3 Triton kernel 加速 -->
+  <div class="chart-box">
+    <h3>P3 · 自研 Triton decode kernel vs torch 朴素</h3>
+    <canvas id="p3kernel"></canvas>
+    <p class="note">预热后稳态 · seq=4096 时最高 1.51× 加速</p>
+  </div>
+
+  <!-- 图4: P3 block_size 扫描 -->
+  <div class="chart-box">
+    <h3>P3 · block_size 扫描（TPOT + KV waste）</h3>
+    <canvas id="p3block"></canvas>
+    <p class="note">prompt 1024 + decode 64 · bs=16 TPOT 最低 27.0ms</p>
+  </div>
+
+  <!-- 图5: P4 吞吐对比 -->
+  <div class="chart-box full">
+    <h3>P4 · 连续批 vs P3 静态批吞吐（warmup+repeat 中位数）</h3>
+    <canvas id="p4throughput"></canvas>
+    <p class="note">12 请求 128/1024/8192 混排 · P3 padding 浪费 61.5% · 目标 ≥2×</p>
+  </div>
+
+  <!-- 图6: P4 TPOT -->
+  <div class="chart-box full">
+    <h3>P4 · TPOT p99：chunked prefill 不劣化 decode</h3>
+    <canvas id="p4tpot"></canvas>
+    <p class="note">纯 decode step 间隔 p99（排除 prefill step）· chunked(512) vs non-chunked(65536)</p>
+  </div>
+</div>
+
+<!-- 详细数据 -->
+<h2>详细数据</h2>
+
+<div class="card">
+  <h3>P2 · KV cache 引入的效果</h3>
+  <p>
+    <b>nano-eager</b>（无 cache，每步重算）：TPOT p50=<span class="metric">35.34ms</span> p99=49.96ms · 吞吐 25.05 tok/s<br>
+    <b>nano-cache</b>（KV cache 复用）：TPOT p50=<span class="metric">21.57ms</span> p99=23.35ms · 吞吐 45.64 tok/s<br>
+    → TPOT p50 降低 <span class="metric">1.64×</span>，p99 降低 <span class="metric">2.14×</span>，吞吐提升 <span class="metric">1.82×</span><br>
+    <span style="color:#8b949e">（warmup=1, repeat=3 中位数，方差 <3%；旧版单次无 warmup 高估了加速比）</span>
+  </p>
+</div>
+
+<div class="card">
+  <h3>P3 · PagedAttention + 自研 Triton kernel</h3>
+  <p>
+    <b>KV waste rate</b>：P2 连续预分配 15% → P3 分页 <span class="metric">1.44%</span>（1025 token）/ <span class="metric">0.024%</span>（32768 token）<br>
+    <b>Triton vs torch</b>（预热后）：seq=128→1.29×, 512→1.25×, 1024→1.12×, 4096→<span class="metric">1.51×</span>, 8192→1.26×<br>
+    <b>32K 长上下文</b>：prefill 3281.7ms · peak 6.59GB · decode <span class="metric">77.8ms</span> · waste 0.024%<br>
+    <b>block_size 扫描</b>：bs=8→28.2ms, bs=16→<span class="metric">27.0ms</span>, bs=32→28.9ms, bs=64→25.9ms（TPOT p50）
+  </p>
+</div>
+
+<div class="card">
+  <h3>P4 · 连续批处理 + varlen prefill 拼批</h3>
+  <p>
+    <b>吞吐</b>（12 请求 128/1024/8192 混排，warmup=1 repeat=3 中位数）：<br>
+    &nbsp;&nbsp;torch 后端：P4 <span class="metric">47.57</span> vs P3 16.72 tok/s = <span class="metric">2.85×</span> ✅<br>
+    &nbsp;&nbsp;flashinfer 后端：P4 <span class="metric">69.19</span> vs P3 23.71 tok/s = <span class="metric">2.92×</span> ✅（反超 torch）<br>
+    <b>TPOT p99</b>（纯 decode step 间隔）：<br>
+    &nbsp;&nbsp;torch：chunked 103.51ms / non-chunked 103.56ms = <span class="metric">0.999×</span>（不劣化）<br>
+    &nbsp;&nbsp;flashinfer：chunked 101.51ms / non-chunked 123.43ms = <span class="metric">0.822×</span>（chunked 略优）<br>
+    <b>关键洞察</b>：varlen 拼批收益主来自 MLP+QKV proj 一次算完（12 次 forward → 1 次），而非 attention kernel 本身
+  </p>
+</div>
+
+<script>
+const colors = {
+  blue: '#58a6ff', green: '#7ee787', yellow: '#d29922',
+  red: '#f85149', purple: '#bc8cff', orange: '#ff9800',
+  cyan: '#39d0d8', pink: '#f778ba'
+};
+const gridColor = '#21262d';
+const tickColor = '#8b949e';
+
+function makeChart(id, type, data, options) {
+  const ctx = document.getElementById(id);
+  new Chart(ctx, { type, data, options: {
+    responsive: true, maintainAspectRatio: false,
+    plugins: { legend: { labels: { color: tickColor, font: { size: 11 } } } },
+    scales: {
+      x: { ticks: { color: tickColor }, grid: { color: gridColor } },
+      y: { ticks: { color: tickColor }, grid: { color: gridColor } },
+      ...options.scales
+    },
+    ...options.extra
+  }});
+}
+
+// P2 TPOT
+makeChart('p2tpot', 'bar', {
+  labels: ['TPOT p50 (ms)', 'TPOT p99 (ms)'],
+  datasets: [
+    { label: 'P2 eager（无 cache）', data: [35.34, 49.96], backgroundColor: colors.red },
+    { label: 'P2 cache（KV 复用）', data: [21.57, 23.35], backgroundColor: colors.green },
+  ]
+}, { scales: {}, extra: {} });
+
+// P2 throughput
+makeChart('p2throughput', 'bar', {
+  labels: ['serial', 'batch=1', 'batch=8', 'batch=16'],
+  datasets: [
+    { label: '吞吐 (tok/s)', data: [42.24, 40.69, 279.21, 392.30], backgroundColor: [colors.red, colors.orange, colors.yellow, colors.green] },
+  ]
+}, { scales: {}, extra: { plugins: { legend: { display: false } } } });
+
+// P3 kernel
+makeChart('p3kernel', 'bar', {
+  labels: ['seq=128', 'seq=512', 'seq=1024', 'seq=4096', 'seq=8192'],
+  datasets: [
+    { label: 'torch 朴素 (ms)', data: [32.34, 33.56, 32.88, 37.34, 34.17], backgroundColor: colors.red },
+    { label: 'Triton kernel (ms)', data: [25.06, 26.90, 29.34, 24.69, 27.09], backgroundColor: colors.green },
+  ]
+}, { scales: {}, extra: {} });
+
+// P3 block_size
+makeChart('p3block', 'bar', {
+  labels: ['bs=8', 'bs=16', 'bs=32', 'bs=64'],
+  datasets: [
+    { label: 'TPOT p50 (ms)', data: [28.20, 26.97, 28.90, 25.94], backgroundColor: colors.blue },
+    { label: 'TPOT p99 (ms)', data: [65.85, 43.11, 45.40, 40.94], backgroundColor: colors.purple },
+  ]
+}, { scales: {}, extra: {} });
+
+// P4 throughput
+makeChart('p4throughput', 'bar', {
+  labels: ['P3 静态批\n(torch)', 'P4 连续批\n(torch)', 'P3 静态批\n(flashinfer)', 'P4 连续批\n(flashinfer)'],
+  datasets: [
+    { label: '吞吐 (tok/s)', data: [16.72, 47.57, 23.71, 69.19],
+      backgroundColor: [colors.red, colors.green, colors.orange, colors.cyan] },
+  ]
+}, { scales: {}, extra: { plugins: { legend: { display: false } } } });
+
+// P4 TPOT
+makeChart('p4tpot', 'bar', {
+  labels: ['torch\nchunked(512)', 'torch\nnon-chunked', 'flashinfer\nchunked(512)', 'flashinfer\nnon-chunked'],
+  datasets: [
+    { label: 'TPOT p99 (ms)', data: [103.51, 103.56, 101.51, 123.43],
+      backgroundColor: [colors.green, colors.blue, colors.cyan, colors.purple] },
+  ]
+}, { scales: {}, extra: { plugins: { legend: { display: false } } } });
+</script>
+</body>
+</html>

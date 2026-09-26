@@ -133,6 +133,8 @@ def main() -> None:
     p.add_argument("--results-dir", default="bench/results")
     p.add_argument("--max-seq-len", type=int, default=None,
                    help="KV cache 预分配长度；默认按数据自动: max(prompt_len)+max(output_len) 向上取 256 倍数")
+    p.add_argument("--warmup", type=int, default=1, help="预热轮数（结果丢弃）")
+    p.add_argument("--repeat", type=int, default=3, help="测量轮数（取中位数）")
     args = p.parse_args()
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -166,33 +168,50 @@ def main() -> None:
 
     warm = requests[0]
     run_one(backend, warm["prompt_ids"][:64], 4, device)
-    print(f"[bench] 预热完成, 开始 {len(requests)} 条")
-
-    results = []
-    for r in requests:
-        rec = run_one(backend, r["prompt_ids"], r["output_len"], device)
-        rec.update({"id": r["id"], "category": r["category"], "prompt_len": r["prompt_len"]})
-        results.append(rec)
-        print(
-            f"  #{r['id']:<3} {r['category']:<13} prompt={r['prompt_len']:<6} "
-            f"TTFT={rec['prefill_ms']:>9.2f}ms  TPOT={statistics.mean(rec['decode_ms']):>7.2f}ms  "
-            f"({1000 / statistics.mean(rec['decode_ms']):>6.1f} tok/s)"
-        )
+    print(f"[bench] 预热完成, warmup={args.warmup} repeat={args.repeat}")
 
     def pct(vals: list[float], q: float) -> float:
         return float(np.percentile(vals, q))
 
-    all_tpot = [statistics.mean(r["decode_ms"]) for r in results]
-    total_out = sum(r["output_len"] for r in results)
-    total_time = sum(r["prefill_ms"] + sum(r["decode_ms"]) for r in results) / 1e3
-    summary = {
-        "ttft_p50_ms": pct([r["prefill_ms"] for r in results], 50),
-        "ttft_p99_ms": pct([r["prefill_ms"] for r in results], 99),
-        "tpot_p50_ms": pct(all_tpot, 50),
-        "tpot_p99_ms": pct(all_tpot, 99),
-        "output_tok_per_s": total_out / total_time if total_time else 0.0,
-        "n_requests": len(results),
-    }
+    def run_round() -> dict:
+        """跑一轮所有请求，返回 summary 指标。"""
+        results = []
+        for r in requests:
+            rec = run_one(backend, r["prompt_ids"], r["output_len"], device)
+            rec.update({"id": r["id"], "category": r["category"], "prompt_len": r["prompt_len"]})
+            results.append(rec)
+
+        all_tpot = [statistics.mean(r["decode_ms"]) for r in results]
+        total_out = sum(r["output_len"] for r in results)
+        total_time = sum(r["prefill_ms"] + sum(r["decode_ms"]) for r in results) / 1e3
+        return {
+            "ttft_p50_ms": pct([r["prefill_ms"] for r in results], 50),
+            "ttft_p99_ms": pct([r["prefill_ms"] for r in results], 99),
+            "tpot_p50_ms": pct(all_tpot, 50),
+            "tpot_p99_ms": pct(all_tpot, 99),
+            "output_tok_per_s": total_out / total_time if total_time else 0.0,
+            "n_requests": len(results),
+        }
+
+    # warmup 轮丢弃
+    for _ in range(args.warmup):
+        run_round()
+
+    # repeat 轮取中位数
+    summaries = [run_round() for _ in range(args.repeat)]
+    keys = ["ttft_p50_ms", "ttft_p99_ms", "tpot_p50_ms", "tpot_p99_ms", "output_tok_per_s"]
+    summary: dict = {}
+    for k in keys:
+        vals = sorted(s[k] for s in summaries)
+        summary[k] = float(np.median(vals))
+        summary[f"{k}_all"] = [float(v) for v in vals]
+    summary["n_requests"] = summaries[0]["n_requests"]
+    summary["warmup"] = args.warmup
+    summary["repeat"] = args.repeat
+
+    print(f"[bench] {args.repeat} 轮中位数:")
+    for k in keys:
+        print(f"  {k:<20} {summary[k]:.2f}  (all: {[f'{v:.2f}' for v in summary[f'{k}_all']]})")
 
     gpu_mem = None
     if device == "cuda":
@@ -214,7 +233,7 @@ def main() -> None:
         "gpu": torch.cuda.get_device_name(0) if device == "cuda" else "cpu",
         "gpu_mem": gpu_mem,
         "summary": summary,
-        "requests": results,
+
     }
     out_dir = Path(args.results_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
