@@ -261,7 +261,7 @@
 
 ## 6. 维度 F · 错误处理与可观测性
 
-### F1 · 完全没有 metrics（**P6 前缀缓存会因此无法验收**）
+### F1 · 完全没有 metrics（**P6 前缀缓存会因此无法验收**） ✅
 
 - **当前位置**：全项目无统计模块；`SchedulerOutput.preempted_seq_ids` **只写不读**（我 grep 过 `core.py`，`step()` 只消费 `scheduled`）。
 - **vLLM 参考**：`vllm/v1/metrics/stats.py`（`SchedulerStats`：num_running / num_waiting / gpu_cache_usage / prefix cache hit rate）、`vllm/v1/metrics/loggers.py`（Prometheus + 日志）、`vllm/v1/core/kv_cache_metrics.py`（`KVCacheMetricsCollector`）。
@@ -495,7 +495,7 @@ P5 chat triton 不达标：chat prompt 在 triton online softmax（float32 累�
 
 ### 未实施项（按审计文档优先级延后）
 
-- **第 3 批**（A6 调度节流 / F1 metrics / TPOT p99 测量）：尾延迟与可观测性。
+- **第 3 批**（A6 调度节流 / TPOT p99 测量）：尾延迟。
 - **A7/A8/B4/C4/C5**：明确推到 P6 之后或 P7 本体。
 
 ### 维度 E · 代码结构与可维护性修复（2026-09-27）
@@ -543,3 +543,8 @@ P5 chat triton 不达标：chat prompt 在 triton online softmax（float32 累�
 - **改动**：新建 `model_executor/legacy_api.py`，移入 P1 eager / P2 连续 cache / P2 静态批的实现体（`generate_eager` / `generate_cached` / `generate_batch` / `forward_last_logits`）；`runner.py` 的 `generate` P1/P2 分支和 `generate_batch` 改为薄委托，`_build_prefill_mask`/`_build_decode_mask` 删除；`_prefill`/`_decode` 保留（chunked prefill 测试直接调用）。
 - **原因**：`runner.py` 322 行混合了 P1 eager / P2 连续 cache / P3 分页 / P4 入口，职责过宽。拆出 P1/P2 到 `legacy_api.py` 后 `runner.py` 降至 ~200 行，主路径（P3+）与历史基线（P1/P2）分离。
 - **文件**：`model_executor/legacy_api.py`（新建）、`model_executor/runner.py`
+#### F1 · step 级 metrics ✅
+
+- **改动**：新建 `engine/stats.py`（`EngineCoreStats` dataclass：本步快照 num_batched_tokens/num_running/num_waiting/num_prefills/num_decodes/cache_usage/waste_rate + 累计 total_steps/total_preempt_count/total_tokens_generated + P6 预留 prefix_cache_hit_rate）；`EngineCore.step()` 每步更新 stats；`AsyncEngineCore.reset()` 重置 stats；`Scheduler` 加 `num_running`/`num_waiting` property；`PagedKVCache` 加 `cache_usage` property；P4 bench 落盘 `p4_stats` JSON。
+- **原因**：全项目无统计模块，`SchedulerOutput.preempted_seq_ids` 只写不读，无法证明抢占路径在 bench 里真的被走过。P6 前缀缓存的验收指标「前缀命中率」必须依赖这套统计。
+- **文件**：`engine/stats.py`（新建）、`engine/core.py`、`engine/scheduler.py`、`kvmm/paged_kv_cache.py`、`server/async_engine.py`、`bench/p4_bench.py`
