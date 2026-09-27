@@ -44,11 +44,11 @@ def sync(device: str) -> None:
 
 
 # P5
-def make_runner(model: str, num_blocks: int, max_seq_len: int, device: str, dtype: torch.dtype, prefill_impl: str = "torch") -> NanoRunner:
+def make_runner(model: str, num_blocks: int, max_seq_len: int, device: str, dtype: torch.dtype, prefill_impl: str = "torch", attn_impl: str = "torch") -> NanoRunner:
     return NanoRunner(
         model, device=device, dtype=dtype,
         max_seq_len=max_seq_len, block_size=16, num_blocks=num_blocks,
-        attn_impl="torch",
+        attn_impl=attn_impl,
         prefill_impl=prefill_impl,
     )
 
@@ -172,7 +172,7 @@ async def bench_overhead(args) -> dict:
     max_seq_len = args.prompt_len + args.max_new_tokens
     num_blocks = (args.num_requests * args.prompt_len + args.num_requests * args.max_new_tokens) // 16 + 32
 
-    runner = make_runner(args.model, num_blocks, max_seq_len, device, dtype, args.prefill_impl)
+    runner = make_runner(args.model, num_blocks, max_seq_len, device, dtype, args.prefill_impl, args.attn_impl)
     app = create_app(
         args.model, device=device, dtype=args.dtype,
         max_seq_len=max_seq_len, num_blocks=num_blocks,
