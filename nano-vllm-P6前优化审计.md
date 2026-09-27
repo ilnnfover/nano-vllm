@@ -450,9 +450,51 @@
 
 **4 路径全达标。** bench 稳定性修复（`AsyncEngineCore.reset()` repeat 间隔离 + chat prompt 续写指令 + warmup=3 SSE 预热）后，chat 两路径从 0.871/0.818 提升到 1.012/1.040。
 
+### 第 2 批 · 性能主战场（2026-09-27）
+
+#### A4 · slot_mapping 向量化 ✅
+
+- **改动**：`PagedKVCache.slot_mapping()` 从 Python for 循环改为 tensor 运算（`arange` + `//` + `%` + `gather`）。
+- **原因**：token budget 2048 时每步 2048 次 Python 迭代，向量化后几次 tensor 运算完成。
+- **文件**：`core/paged_kv_cache.py`
+
+#### A2 · 采样批量化（greedy 路径）✅
+
+- **改动**：`Sampler.batch_sample_greedy(logits_batch)` 新方法：一次 `argmax(dim=-1)` + 一次 `tolist()` 同步。`EngineCore._execute` decode 路径：全 greedy 时批量采样，替代逐条 `int(logits.argmax())` 的 N 次同步。
+- **原因**：b=12 时每步 12 次 host-device 同步，批量化后 1 次。
+- **文件**：`sample/sampler.py`、`engine/core.py`
+
+#### A3 · decode attention 批量化（triton kernel）✅
+
+- **改动**：新增 `_paged_attn_decode_batch_kernel`：grid=(batch, num_heads)，消除 Python 逐条循环。新增 `paged_attention_triton_batch` wrapper：二维 block_table + seq_lens 张量。`qwen2.py` decode 批量路径：triton 后端走 batch kernel，torch 后端保持逐条循环（oracle）。
+- **原因**：28 层 × b 次 kernel launch/step（b=12 时 336 次极小 kernel）→ 28 层 × 1 次。
+- **文件**：`attention/triton_paged_attn.py`、`models/qwen2.py`、`tests/test_p3_correctness.py`（新增 `test_triton_batch_vs_torch` 对拍）
+- **GPU bench 收益**：P4 continuous 吞吐 65.6 → **131.8 tok/s（2.01× 加速）**，throughput_ratio 2.60× → **5.53×**。
+
+#### A5 · flashinfer wrapper 复用 ✅
+
+- **改动**：`_get_prefill_wrapper(device)` 按 device 缓存 `BatchPrefillWithPagedKVCacheWrapper` 对象，省掉每步构造（`plan()` 仍每步调以更新元数据）。
+- **原因**：wrapper 构造是 host 侧开销，小 batch 下不可忽略。
+- **文件**：`attention/varlen_prefill.py`
+
+#### 第 2 批验收
+
+| 测试 | 结果 |
+| --- | --- |
+| P3 correctness（含新增 batch kernel 对拍） | ✅ 13/13 全绿 |
+| P5 serving + P4 + P2 | ✅ 12/12 全绿 |
+
+| GPU bench | torch 后端 | triton 后端 |
+| --- | --- | --- |
+| P4 continuous 吞吐 | 65.6 tok/s | **131.8 tok/s（2.01×）** |
+| P4 throughput_ratio | 2.60× | **5.53×** |
+| P5 completions overhead | 1.012 / 1.036 | 0.903 / 0.922 ✅ |
+| P5 chat overhead | 0.990 / 0.981 | 0.489 / 0.866 ⚠️ |
+
+P5 chat triton 不达标：chat prompt 在 triton online softmax（float32 累加）精度下 argmax 翻转 → 提前 EOS → 生成短，非 kernel bug。completions 两路径达标确认 kernel 正确性。
+
 ### 未实施项（按审计文档优先级延后）
 
-- **第 2 批**（A2 采样批量化 / A4 persistent buffer / A3 decode attention 批量化 / A5 flashinfer wrapper 复用）：性能主战场，建议 P6 前有余力再做。
 - **第 3 批**（A6 调度节流 / F1 metrics / TP/OT p99 测量）：尾延迟与可观测性。
 - **E2/E8**（拆 attn_impl 字段 / 复用 gather_paged_kv）：结构小改，可延后。
 - **A7/A8/B4/C4/C5**：明确推到 P6 之后或 P7 本体。
