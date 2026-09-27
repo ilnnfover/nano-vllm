@@ -44,7 +44,7 @@ class TestP5Serving(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resp.status_code, 200)
         data = resp.json()
         self.assertEqual(data["object"], "text_completion")
-        self.assertEqual(data["choices"][0]["finish_reason"], "stop")
+        self.assertEqual(data["choices"][0]["finish_reason"], "length")
         self.assertTrue(len(data["choices"][0]["text"]) > 0)
         self.assertEqual(data["usage"]["completion_tokens"], MAX_TOKENS)
 
@@ -71,7 +71,7 @@ class TestP5Serving(unittest.IsolatedAsyncioTestCase):
             if line.startswith("data: ") and line != "data: [DONE]":
                 chunk = json.loads(line[6:])
                 stream_text += chunk["choices"][0]["text"]
-                if chunk["choices"][0]["finish_reason"] == "stop":
+                if chunk["choices"][0]["finish_reason"] is not None:
                     done = True
             elif line == "data: [DONE]":
                 done = True
@@ -118,7 +118,7 @@ class TestP5Serving(unittest.IsolatedAsyncioTestCase):
                 delta = chunk["choices"][0]["delta"]
                 if "content" in delta:
                     stream_text += delta["content"]
-                if chunk["choices"][0]["finish_reason"] == "stop":
+                if chunk["choices"][0]["finish_reason"] is not None:
                     done = True
             elif line == "data: [DONE]":
                 done = True

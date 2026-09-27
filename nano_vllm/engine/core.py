@@ -45,6 +45,10 @@ class EngineCore:
         self.scheduler.add_request(seq)
         return seq
 
+    def abort(self, seq_id: int) -> None:
+        """中止请求（C1）。"""
+        self.scheduler.abort(seq_id)
+
     def step(self) -> tuple[list[Sequence], dict[int, int]]:
         """执行一次调度+前向，返回 (完成的 sequences, 本步产出的 {seq_id: token_id})。"""
         if not self.scheduler.has_requests():

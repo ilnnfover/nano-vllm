@@ -13,17 +13,11 @@ import torch
 from nano_vllm.attention.metadata import AttentionMetadata
 from nano_vllm.config import Qwen2Config
 from nano_vllm.core.paged_kv_cache import PagedKVCache
+from nano_vllm.engine.sequence import SamplingParams  # re-export for backward compat
 from nano_vllm.kv_cache import KVCache
 from nano_vllm.models.qwen2 import Qwen2ForCausalLM
 from nano_vllm.sample.sampler import Sampler
 
-
-@dataclass
-class SamplingParams:
-    temperature: float = 1.0
-    top_k: int = 0
-    top_p: float = 1.0
-    max_new_tokens: int = 128
 
 
 class NanoRunner:
@@ -60,10 +54,12 @@ class NanoRunner:
             dtype=dtype,
             device=device,
         )
-        # P3 分页 KV cache：num_blocks 缺省时按 max_seq_len 推导（单条够用即可）
+        # P3 分页 KV cache：num_blocks 缺省时按显存反推（B1）
+        if num_blocks is None:
+            num_blocks = self._profile_num_blocks(block_size, dtype, device)
         self.paged_cache = PagedKVCache(
             num_layers=self.config.num_hidden_layers,
-            num_blocks=num_blocks or PagedKVCache.blocks_needed(max_seq_len, block_size) + 1,
+            num_blocks=num_blocks,
             block_size=block_size,
             num_kv_heads=self.config.num_key_value_heads,
             head_dim=self.config.head_dim,
@@ -73,6 +69,20 @@ class NanoRunner:
         self._block_table: list[int] | None = None
         self._paged_seq_len = 0
         self.pad_id = 0
+
+    def _profile_num_blocks(self, block_size: int, dtype: torch.dtype, device: str) -> int:
+        """按剩余显存反推 num_blocks（B1）。CPU 回退到单条够用的默认值。"""
+        fallback = PagedKVCache.blocks_needed(self.config.max_position_embeddings, block_size) + 1
+        if device != "cuda" or not torch.cuda.is_available():
+            return fallback
+        free_bytes, _ = torch.cuda.mem_get_info()
+        per_token_kv = (
+            self.config.num_hidden_layers * 2 * self.config.num_key_value_heads
+            * self.config.head_dim * dtype.itemsize
+        )
+        per_block = block_size * per_token_kv
+        num_blocks = int(free_bytes * 0.5 / per_block)
+        return max(num_blocks, fallback)
 
     @property
     def eos_ids(self) -> set[int]:

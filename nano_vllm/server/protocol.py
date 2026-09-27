@@ -43,13 +43,13 @@ def _cid(prefix: str) -> str:
     return f"{prefix}-{uuid.uuid4().hex[:8]}"
 
 
-def make_completion_response(text: str, model: str, prompt_tokens: int, completion_tokens: int) -> dict:
+def make_completion_response(text: str, model: str, prompt_tokens: int, completion_tokens: int, finish_reason: str = "stop") -> dict:
     return {
         "id": _cid("cmpl"),
         "object": "text_completion",
         "created": _ts(),
         "model": model,
-        "choices": [{"text": text, "index": 0, "finish_reason": "stop"}],
+        "choices": [{"text": text, "index": 0, "finish_reason": finish_reason}],
         "usage": {
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
@@ -58,23 +58,23 @@ def make_completion_response(text: str, model: str, prompt_tokens: int, completi
     }
 
 
-def make_completion_chunk(text: str, model: str, finish: bool) -> dict:
+def make_completion_chunk(text: str, model: str, finish: bool, cid: str | None = None, created: int | None = None, finish_reason: str = "stop") -> dict:
     return {
-        "id": _cid("cmpl"),
+        "id": cid or _cid("cmpl"),
         "object": "text_completion",
-        "created": _ts(),
+        "created": created or _ts(),
         "model": model,
-        "choices": [{"text": text, "index": 0, "finish_reason": "stop" if finish else None}],
+        "choices": [{"text": text, "index": 0, "finish_reason": finish_reason if finish else None}],
     }
 
 
-def make_chat_response(text: str, model: str, prompt_tokens: int, completion_tokens: int) -> dict:
+def make_chat_response(text: str, model: str, prompt_tokens: int, completion_tokens: int, finish_reason: str = "stop") -> dict:
     return {
         "id": _cid("chatcmpl"),
         "object": "chat.completion",
         "created": _ts(),
         "model": model,
-        "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": finish_reason}],
         "usage": {
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
@@ -83,11 +83,11 @@ def make_chat_response(text: str, model: str, prompt_tokens: int, completion_tok
     }
 
 
-def make_chat_chunk(text: str, model: str, finish: bool) -> dict:
+def make_chat_chunk(text: str, model: str, finish: bool, cid: str | None = None, created: int | None = None, finish_reason: str = "stop") -> dict:
     return {
-        "id": _cid("chatcmpl"),
+        "id": cid or _cid("chatcmpl"),
         "object": "chat.completion.chunk",
-        "created": _ts(),
+        "created": created or _ts(),
         "model": model,
-        "choices": [{"index": 0, "delta": {"content": text} if text else {}, "finish_reason": "stop" if finish else None}],
+        "choices": [{"index": 0, "delta": {"content": text} if text else {}, "finish_reason": finish_reason if finish else None}],
     }

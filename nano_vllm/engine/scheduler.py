@@ -83,6 +83,29 @@ class Scheduler:
     def has_requests(self) -> bool:
         return bool(self.waiting) or bool(self.running)
 
+    def abort(self, seq_id: int) -> None:
+        """中止请求：从 running/waiting 移除 + 释放 block（C1）。"""
+        for seq in self.running:
+            if seq.seq_id == seq_id:
+                self._free_seq_blocks(seq)
+                self.running.remove(seq)
+                return
+        for seq in list(self.waiting):
+            if seq.seq_id == seq_id:
+                self._free_seq_blocks(seq)
+                self.waiting.remove(seq)
+                return
+
+    @property
+    def waste_rate(self) -> float:
+        """实时浪费率：1 - Σ(seq_len) / (num_used_blocks * block_size)（B3）。"""
+        total_tokens = sum(seq.num_tokens for seq in self.running)
+        num_used = self.paged_cache.pool.num_total_blocks - self.paged_cache.pool.num_free_blocks
+        if num_used == 0:
+            return 0.0
+        return 1.0 - total_tokens / (num_used * self.block_size)
+
+
     def _try_ensure_capacity(self, seq: Sequence, new_seq_len: int) -> bool:
         """检查并分配 block 使 block_table 能容纳 new_seq_len 个 token。
 

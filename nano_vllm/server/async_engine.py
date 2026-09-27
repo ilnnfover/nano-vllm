@@ -29,7 +29,16 @@ class AsyncEngineCore:
     async def _step_loop(self) -> None:
         """后台单 step 循环：to_thread(step) → token 分发到各请求 queue。"""
         while self.engine.scheduler.has_requests():
-            finished, sampled = await asyncio.to_thread(self.engine.step)
+            try:
+                finished, sampled = await asyncio.to_thread(self.engine.step)
+            except Exception:
+                # C2 异常隔离：abort 全部请求 + 发完成信号，避免永久挂起
+                for seq_id in list(self._token_queues.keys()):
+                    self.engine.abort(seq_id)
+                    q = self._token_queues.get(seq_id)
+                    if q is not None:
+                        await q.put(None)
+                continue
             for seq_id, token_id in sampled.items():
                 q = self._token_queues.get(seq_id)
                 if q is not None:
@@ -58,6 +67,7 @@ class AsyncEngineCore:
                 tokens.append(token)
         finally:
             self._token_queues.pop(seq.seq_id, None)
+            self.engine.abort(seq.seq_id)
         return tokens
 
     async def generate_stream(
@@ -78,6 +88,7 @@ class AsyncEngineCore:
                 yield token
         finally:
             self._token_queues.pop(seq.seq_id, None)
+            self.engine.abort(seq.seq_id)
 
     async def aclose(self) -> None:
         if self._step_task is not None and not self._step_task.done():
