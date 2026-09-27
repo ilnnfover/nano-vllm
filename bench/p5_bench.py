@@ -241,6 +241,7 @@ def main() -> None:
     p.add_argument("--max-new-tokens", type=int, default=64)
     p.add_argument("--budget", type=int, default=2048, help="max_num_batched_tokens")
     p.add_argument("--prefill-impl", default="torch", choices=["torch", "flashinfer"])
+    p.add_argument("--attn-impl", default="torch", choices=["torch", "triton"])
     p.add_argument("--warmup", type=int, default=3)
     p.add_argument("--repeat", type=int, default=3)
     p.add_argument("--tag", default=None)
