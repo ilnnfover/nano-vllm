@@ -176,7 +176,8 @@ async def bench_overhead(args) -> dict:
     app = create_app(
         args.model, device=device, dtype=args.dtype,
         max_seq_len=max_seq_len, num_blocks=num_blocks,
-        max_num_batched_tokens=args.budget, prefill_impl=args.prefill_impl,
+        max_num_batched_tokens=args.budget, attn_impl=args.attn_impl,
+        prefill_impl=args.prefill_impl,
     )
 
     http_modes = [
