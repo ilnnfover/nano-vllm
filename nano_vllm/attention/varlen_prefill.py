@@ -27,6 +27,8 @@ from nano_vllm.attention.paged_attn import repeat_kv
 
 # flashinfer workspace 复用（128MB，按 device 缓存，避免每步重复分配）
 _FLASHINFER_WORKSPACE: dict[str, torch.Tensor] = {}
+# A5: wrapper 复用（按 device 缓存，省掉每步 BatchPrefillWithPagedKVCacheWrapper 构造）
+_FLASHINFER_WRAPPER: dict[str, object] = {}
 
 
 def _get_workspace(device: torch.device, size_bytes: int = 128 * 1024 * 1024) -> torch.Tensor:
@@ -34,6 +36,17 @@ def _get_workspace(device: torch.device, size_bytes: int = 128 * 1024 * 1024) ->
     if key not in _FLASHINFER_WORKSPACE:
         _FLASHINFER_WORKSPACE[key] = torch.empty(size_bytes, dtype=torch.uint8, device=device)
     return _FLASHINFER_WORKSPACE[key]
+
+
+def _get_prefill_wrapper(device: torch.device):
+    """A5 · 复用 flashinfer wrapper（按 device 缓存，plan() 仍每步调以更新元数据）。"""
+    key = str(device)
+    if key not in _FLASHINFER_WRAPPER:
+        import flashinfer
+        _FLASHINFER_WRAPPER[key] = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+            _get_workspace(device), "NHD"
+        )
+    return _FLASHINFER_WRAPPER[key]
 
 
 def build_paged_kv_metadata(
@@ -134,9 +147,7 @@ def varlen_prefill_flashinfer(
     head_dim = q.shape[2]
     block_size = k_cache.shape[1]
 
-    wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-        _get_workspace(q.device), "NHD"
-    )
+    wrapper = _get_prefill_wrapper(q.device)
     wrapper.plan(
         qo_indptr.to(torch.int32),
         paged_kv_indptr.to(torch.int32),

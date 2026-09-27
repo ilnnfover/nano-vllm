@@ -78,8 +78,16 @@ class EngineCore:
         elif len(decode_seqs) > 1:
             seqs = [s.seq for s in decode_seqs]
             logits_list = self._run_decode_batched(seqs)
-            for seq, logits in zip(seqs, logits_list):
-                sampled[seq.seq_id] = self._sample(seq, logits)
+            # A2: 批量 greedy 采样（一次 argmax 替代逐条 int() 的 N 次同步）
+            all_greedy = all(seq.sampling_params.temperature <= 0.0 for seq in seqs)
+            if all_greedy:
+                logits_batch = torch.stack(logits_list)
+                token_ids = self.runner.sampler.batch_sample_greedy(logits_batch)
+                for seq, tid in zip(seqs, token_ids):
+                    sampled[seq.seq_id] = tid
+            else:
+                for seq, logits in zip(seqs, logits_list):
+                    sampled[seq.seq_id] = self._sample(seq, logits)
 
         return sampled
 

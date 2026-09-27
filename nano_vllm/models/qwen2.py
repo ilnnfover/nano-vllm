@@ -12,6 +12,7 @@ import torch.nn.functional as F
 
 from nano_vllm.attention.backend import get_paged_attn
 from nano_vllm.attention.metadata import AttentionMetadata
+from nano_vllm.attention.triton_paged_attn import paged_attention_triton_batch
 from nano_vllm.attention.varlen_prefill import varlen_prefill_attention
 from nano_vllm.config import Qwen2Config
 
@@ -174,18 +175,29 @@ class Attention(nn.Module):
                     self.scaling,
                 ).unsqueeze(0)
             else:
-                outs = []
-                for i in range(b):
-                    outs.append(attn_fn(
-                        q[i],
+                if metadata.attn_impl == "triton":
+                    out = paged_attention_triton_batch(
+                        q,
                         paged_cache.k_cache[layer_idx],
                         paged_cache.v_cache[layer_idx],
-                        metadata.block_tables[i],
-                        metadata.seq_lens[i],
+                        metadata.block_tables,
+                        metadata.seq_lens,
                         self.num_kv_heads,
                         self.scaling,
-                    ))
-                out = torch.stack(outs)
+                    )
+                else:
+                    outs = []
+                    for i in range(b):
+                        outs.append(attn_fn(
+                            q[i],
+                            paged_cache.k_cache[layer_idx],
+                            paged_cache.v_cache[layer_idx],
+                            metadata.block_tables[i],
+                            metadata.seq_lens[i],
+                            self.num_kv_heads,
+                            self.scaling,
+                        ))
+                    out = torch.stack(outs)
         return self.o_proj(out.transpose(1, 2).reshape(b, s, -1))
 
     def forward(

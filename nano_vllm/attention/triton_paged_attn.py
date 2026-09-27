@@ -126,3 +126,118 @@ def paged_attention_triton(
         BLOCK_N=BLOCK_N,
     )
     return out.reshape(num_heads, 1, head_dim)
+
+@triton.jit
+def _paged_attn_decode_batch_kernel(
+    q_ptr,
+    k_cache_ptr,
+    v_cache_ptr,
+    block_table_ptr,
+    seq_len_ptr,
+    out_ptr,
+    num_kv_heads,
+    head_dim,
+    block_size,
+    max_blocks,
+    num_queries_per_kv,
+    scaling,
+    BLOCK_D: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """A3 · 批量 decode kernel：grid=(batch, num_heads)，消除 Python 逐条循环。"""
+    batch_idx = tl.program_id(0)
+    head_idx = tl.program_id(1)
+    kv_head_idx = head_idx // num_queries_per_kv
+    seq_len = tl.load(seq_len_ptr + batch_idx)
+
+    offs_d = tl.arange(0, BLOCK_D)
+    d_mask = offs_d < head_dim
+    q_base = batch_idx * num_queries_per_kv * num_kv_heads * head_dim + head_idx * head_dim
+    q = tl.load(q_ptr + q_base + offs_d, mask=d_mask, other=0.0)
+
+    m_i = float("-inf")
+    l_i = 0.0
+    acc = tl.zeros([BLOCK_D], dtype=tl.float32)
+
+    num_blocks = tl.cdiv(seq_len, block_size)
+    offs_n = tl.arange(0, BLOCK_N)
+    for blk_i in range(num_blocks):
+        physical = tl.load(block_table_ptr + batch_idx * max_blocks + blk_i)
+        base = physical * block_size * num_kv_heads * head_dim + kv_head_idx * head_dim
+        n_mask = (blk_i * block_size + offs_n) < seq_len
+        n_mask = n_mask & (offs_n < block_size)
+
+        k_ptrs = k_cache_ptr + base + offs_n[:, None] * (num_kv_heads * head_dim) + offs_d[None, :]
+        k = tl.load(k_ptrs, mask=n_mask[:, None] & d_mask[None, :], other=0.0)
+        scores = tl.sum(q[None, :] * k, axis=1) * scaling
+        scores = tl.where(n_mask, scores, float("-inf"))
+
+        m_new = tl.maximum(m_i, tl.max(scores, axis=0))
+        alpha = tl.exp(m_i - m_new)
+        p = tl.exp(scores - m_new)
+        l_i = l_i * alpha + tl.sum(p, axis=0)
+
+        v_ptrs = v_cache_ptr + base + offs_n[:, None] * (num_kv_heads * head_dim) + offs_d[None, :]
+        v = tl.load(v_ptrs, mask=n_mask[:, None] & d_mask[None, :], other=0.0)
+        acc = acc * alpha + tl.sum(p[:, None] * v, axis=0)
+        m_i = m_new
+
+    out = acc / l_i
+    tl.store(out_ptr + q_base + offs_d, out, mask=d_mask)
+
+
+def paged_attention_triton_batch(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    block_tables: list[list[int]],
+    seq_lens: list[int],
+    num_kv_heads: int,
+    scaling: float,
+) -> torch.Tensor:
+    """A3 · Triton 批量 paged attention（decode 多条一次算完）。
+
+    Args:
+        q: [b, num_heads, 1, head_dim]
+        k_cache/v_cache: [num_blocks, block_size, num_kv_heads, head_dim]
+        block_tables: list[list[int]]，每请求的 block_table
+        seq_lens: list[int]，每请求的实际 KV 长度
+    Returns:
+        [b, num_heads, 1, head_dim]
+    """
+    b, num_heads, _, head_dim = q.shape
+    if not q.is_cuda and not _INTERPRET:
+        raise RuntimeError("Triton kernel 需要 CUDA 设备（或设 TRITON_INTERPRET=1 走 CPU 解释器）")
+
+    block_size = k_cache.shape[1]
+    num_queries_per_kv = num_heads // num_kv_heads
+    max_blocks = max(len(bt) for bt in block_tables)
+
+    bt_2d = torch.zeros(b, max_blocks, dtype=torch.int32, device=q.device)
+    for i, bt in enumerate(block_tables):
+        bt_2d[i, : len(bt)] = torch.tensor(bt, dtype=torch.int32, device=q.device)
+    seq_lens_t = torch.tensor(seq_lens, dtype=torch.int32, device=q.device)
+
+    q_flat = q.reshape(b, num_heads, head_dim).contiguous()
+    out = torch.empty_like(q_flat)
+
+    BLOCK_D = triton.next_power_of_2(head_dim)
+    BLOCK_N = triton.next_power_of_2(block_size)
+
+    _paged_attn_decode_batch_kernel[(b, num_heads)](
+        q_flat,
+        k_cache,
+        v_cache,
+        bt_2d,
+        seq_lens_t,
+        out,
+        num_kv_heads,
+        head_dim,
+        block_size,
+        max_blocks,
+        num_queries_per_kv,
+        scaling,
+        BLOCK_D=BLOCK_D,
+        BLOCK_N=BLOCK_N,
+    )
+    return out.reshape(b, num_heads, 1, head_dim)

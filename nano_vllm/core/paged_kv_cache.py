@@ -89,12 +89,12 @@ class PagedKVCache:
         return block_table
 
     def slot_mapping(self, block_table: list[int], start_pos: int, num_tokens: int) -> torch.Tensor:
-        """构造 [start_pos, start_pos+num_tokens) 区间 token 的物理 slot 索引。"""
-        slots = [
-            block_table[t // self.block_size] * self.block_size + (t % self.block_size)
-            for t in range(start_pos, start_pos + num_tokens)
-        ]
-        return torch.tensor(slots, dtype=torch.long, device=self.device)
+        """构造 [start_pos, start_pos+num_tokens) 区间 token 的物理 slot 索引（向量化）。"""
+        positions = torch.arange(start_pos, start_pos + num_tokens, device=self.device)
+        block_idx = (positions // self.block_size).to(torch.long)
+        offset = (positions % self.block_size).to(torch.long)
+        block_ids = torch.tensor(block_table, dtype=torch.long, device=self.device)
+        return block_ids[block_idx] * self.block_size + offset
 
     def write(self, layer_idx: int, k: torch.Tensor, v: torch.Tensor, slot_mapping: torch.Tensor) -> None:
         """写入单层 KV。

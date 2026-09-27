@@ -134,6 +134,36 @@ class TestPagedAttention(unittest.TestCase):
             b = paged_attention_torch(q, k, v, bt, seq_len, 2, 128**-0.5)
             self.assertLess((a - b).abs().max().item(), 1e-4, f"seq={seq_len} bs={bs}")
 
+    def test_triton_batch_vs_torch(self):
+        """A3 · 批量 triton kernel 对拍：不同 seq_len 混排，含非整除 block_size 边界。"""
+        if not torch.cuda.is_available() and not INTERPRET:
+            self.skipTest("需要 CUDA 或 TRITON_INTERPRET=1")
+        from nano_vllm.attention.triton_paged_attn import paged_attention_triton_batch
+
+        num_heads, num_kv_heads, head_dim = 12, 2, 128
+        block_size, num_blocks = 16, 256
+        seq_lens = [17, 100, 5, 33]
+        g = torch.Generator().manual_seed(99)
+        k_cache = torch.randn(num_blocks, block_size, num_kv_heads, head_dim, generator=g)
+        v_cache = torch.randn(num_blocks, block_size, num_kv_heads, head_dim, generator=g)
+        q_batch = torch.randn(len(seq_lens), num_heads, 1, head_dim, generator=g)
+        block_tables = []
+        offset = 0
+        for sl in seq_lens:
+            n_need = (sl + block_size - 1) // block_size
+            block_tables.append(list(range(offset, offset + n_need)))
+            offset += n_need
+
+        out_batch = paged_attention_triton_batch(
+            q_batch, k_cache, v_cache, block_tables, seq_lens, num_kv_heads, 128**-0.5,
+        )
+        for i, sl in enumerate(seq_lens):
+            out_ref = paged_attention_torch(
+                q_batch[i], k_cache, v_cache, block_tables[i], sl, num_kv_heads, 128**-0.5,
+            )
+            diff = (out_batch[i] - out_ref).abs().max().item()
+            self.assertLess(diff, 1e-4, f"batch idx={i} seq={sl}")
+
 
 class TestPagedGenerate(unittest.TestCase):
     @classmethod

@@ -43,3 +43,10 @@ class Sampler:
 
         probs = torch.softmax(logits, dim=-1)
         return int(torch.multinomial(probs, num_samples=1, generator=self.generator))
+    @torch.no_grad()
+    def batch_sample_greedy(self, logits_batch: torch.Tensor) -> list[int]:
+        """批量 greedy 采样：logits_batch [n, vocab] → list[int]（A2）。
+
+        一次 argmax + 一次 tolist 同步，替代逐条 int(logits.argmax()) 的 N 次同步。
+        """
+        return logits_batch.argmax(dim=-1).tolist()
