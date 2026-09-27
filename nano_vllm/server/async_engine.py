@@ -10,6 +10,7 @@ import asyncio
 
 from nano_vllm.engine.core import EngineCore
 from nano_vllm.engine.sequence import SamplingParams, Sequence
+from nano_vllm.engine.stats import EngineCoreStats
 
 
 class AsyncEngineCore:
@@ -108,6 +109,7 @@ class AsyncEngineCore:
         self.engine.scheduler._next_seq_id = 0
         self.engine._next_seq_id = 0
         self.engine.runner.paged_cache.reset()
+        self.engine.stats = EngineCoreStats()
 
     async def aclose(self) -> None:
         if self._step_task is not None and not self._step_task.done():

@@ -86,6 +86,7 @@ def run_p4_continuous(
         "throughput_tok_s": throughput,
         "num_requests": len(prompts),
         "max_num_batched_tokens": max_num_batched_tokens,
+        "stats": engine.stats.to_dict(),
     }
 
 
@@ -193,6 +194,7 @@ def bench_throughput(args) -> dict:
         "pass": ratio >= 2.0,
         "warmup": args.warmup,
         "repeat": args.repeat,
+        "p4_stats": p4_runs[-1]["stats"],
     }
 
 

@@ -74,6 +74,14 @@ class Scheduler:
     def num_free_blocks(self) -> int:
         return self.paged_cache.pool.num_free_blocks
 
+    @property
+    def num_running(self) -> int:
+        return len(self.running)
+
+    @property
+    def num_waiting(self) -> int:
+        return len(self.waiting)
+
     def blocks_needed(self, seq_len: int) -> int:
         return (seq_len + self.block_size - 1) // self.block_size
 
@@ -100,7 +108,7 @@ class Scheduler:
     def waste_rate(self) -> float:
         """实时浪费率：1 - Σ(seq_len) / (num_used_blocks * block_size)（B3）。"""
         total_tokens = sum(seq.num_tokens for seq in self.running)
-        num_used = self.paged_cache.pool.num_total_blocks - self.paged_cache.pool.num_free_blocks
+        num_used = self.paged_cache.pool.num_blocks - self.paged_cache.pool.num_free_blocks
         if num_used == 0:
             return 0.0
         return 1.0 - total_tokens / (num_used * self.block_size)

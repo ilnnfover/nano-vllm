@@ -133,6 +133,11 @@ class PagedKVCache:
         return self.pool.num_used_blocks
 
     @property
+    def cache_usage(self) -> float:
+        """已分配块占总块数的比例（F1 metrics）。"""
+        return self.num_used_blocks / self.num_blocks
+
+    @property
     def allocated_slots(self) -> int:
         return self.pool.num_used_blocks * self.block_size
 

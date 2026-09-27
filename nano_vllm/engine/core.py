@@ -15,6 +15,7 @@ from nano_vllm.attention.metadata import AttentionMetadata
 from nano_vllm.attention.varlen_prefill import build_paged_kv_metadata
 from nano_vllm.engine.scheduler import Scheduler, SchedulerOutput
 from nano_vllm.engine.sequence import Sequence, SamplingParams
+from nano_vllm.engine.stats import EngineCoreStats
 from nano_vllm.model_executor.runner import NanoRunner
 
 
@@ -31,6 +32,7 @@ class EngineCore:
         self.dtype = runner.dtype
         self._next_seq_id = 0
         self.prefill_mode = prefill_mode
+        self.stats = EngineCoreStats()
 
     def add_request(
         self,
@@ -58,6 +60,17 @@ class EngineCore:
         scheduler_output = self.scheduler.schedule()
         sampled = self._execute(scheduler_output)
         finished = self.scheduler.update_from_output(scheduler_output, sampled)
+        self.stats.update(
+            num_batched_tokens=scheduler_output.num_batched_tokens,
+            num_running=self.scheduler.num_running,
+            num_waiting=self.scheduler.num_waiting,
+            num_prefills=scheduler_output.num_prefills,
+            num_decodes=scheduler_output.num_decodes,
+            cache_usage=self.runner.paged_cache.cache_usage,
+            waste_rate=self.scheduler.waste_rate,
+            preempt_count=len(scheduler_output.preempted_seq_ids),
+            tokens_generated=len(sampled),
+        )
         return finished, sampled
 
     def _execute(self, scheduler_output: SchedulerOutput) -> dict[int, int]:
