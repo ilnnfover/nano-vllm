@@ -246,14 +246,14 @@
 
 | 项 | 当前位置 | 问题 | vLLM 参考 | 建议 | 成本 |
 |---|---|---|---|---|---|
-| E1 | `engine/sequence.py` 与 `model_executor/runner.py` 各有一份 `SamplingParams` | 两份同名类，`p4_bench.py` 已被迫写成 `as RunnerParams` | `vllm/sampling_params.py` 单一定义 | 合并到 `types.py`，`__init__.py` 导出 | 低 |
-| E2 | `AttentionMetadata.attn_impl` | prefill 时被赋成 `prefill_impl`，decode 时才是真 `attn_impl`，语义双关 | `vllm/v1/attention/backends/` 元数据按 backend 分离 | 拆成 `attn_impl` + `prefill_impl` 两字段 | 低 |
-| E3 | `nano_vllm/core/`（块池） vs `nano_vllm/engine/core.py`（主循环） | 目录撞名，语义无关 | vLLM 里 `v1/core/` 只指调度与 KV 管理 | `core/` 改名 `kvmm/` 或并入 `engine/` | 中 |
-| E4 | `attention/varlen_prefill.py` 内 `if impl == ...` 自行分发 | prefill 后端不在 `backend.py` 注册表里（P0-07 只修一半） | `vllm/v1/attention/backends/` 注册表 | prefill 也进注册表 | 低 |
-| E5 | `runner.py` 同时管模型加载 + 两种 cache + sampler + P1/P2 三个历史入口 | 职责过宽 | `vllm/v1/worker/` 分层 | `legacy_api.py` 拆出 P1/P2 入口 | 中 |
-| E6 | `core.py::_run_prefill()` 是死代码 | 但它是证明「varlen 拼批有效」的唯一对照组 | — | **复活成开关**（`--prefill-mode {batched,per-seq}`），别删 | 极低 |
-| E7 | 无 `pyproject.toml`、`__init__.py` 为空 | `api.py` 顶部有 `sys.path.insert` hack | vLLM 有完整打包配置 | 补 `pyproject.toml` | 低 |
-| E8 | `attention/varlen_prefill.py` 内联重写了 `gather_paged_kv` | 与 `paged_attn.py::gather_paged_kv` 重复 | — | 改为直接调用 | 极低 |
+| E1 ✅ | `engine/sequence.py` 与 `model_executor/runner.py` 各有一份 `SamplingParams` | 两份同名类，`p4_bench.py` 已被迫写成 `as RunnerParams` | `vllm/sampling_params.py` 单一定义 | 合并到 `types.py`，`__init__.py` 导出 | 低 |
+| E2 ✅ | `AttentionMetadata.attn_impl` | prefill 时被赋成 `prefill_impl`，decode 时才是真 `attn_impl`，语义双关 | `vllm/v1/attention/backends/` 元数据按 backend 分离 | 拆成 `attn_impl` + `prefill_impl` 两字段 | 低 |
+| E3 ✅ | `nano_vllm/core/`（块池） vs `nano_vllm/engine/core.py`（主循环） | 目录撞名，语义无关 | vLLM 里 `v1/core/` 只指调度与 KV 管理 | `core/` 改名 `kvmm/` 或并入 `engine/` | 中 |
+| E4 ✅ | `attention/varlen_prefill.py` 内 `if impl == ...` 自行分发 | prefill 后端不在 `backend.py` 注册表里（P0-07 只修一半） | `vllm/v1/attention/backends/` 注册表 | prefill 也进注册表 | 低 |
+| E5 ✅ | `runner.py` 同时管模型加载 + 两种 cache + sampler + P1/P2 三个历史入口 | 职责过宽 | `vllm/v1/worker/` 分层 | `legacy_api.py` 拆出 P1/P2 入口 | 中 |
+| E6 ✅ | `core.py::_run_prefill()` 是死代码 | 但它是证明「varlen 拼批有效」的唯一对照组 | — | **复活成开关**（`--prefill-mode {batched,per-seq}`），别删 | 极低 |
+| E7 ✅ | 无 `pyproject.toml`、`__init__.py` 为空 | `api.py` 顶部有 `sys.path.insert` hack | vLLM 有完整打包配置 | 补 `pyproject.toml` | 低 |
+| E8 ✅ | `attention/varlen_prefill.py` 内联重写了 `gather_paged_kv` | 与 `paged_attn.py::gather_paged_kv` 重复 | — | 改为直接调用 | 极低 |
 
 > 注意：P2 的 `generate_batch` / `paged_attention_sdpa` / P1 eager **不要删**——它们是所有加速比的分母与 P3 完成标准要求的对照物。
 
@@ -495,6 +495,51 @@ P5 chat triton 不达标：chat prompt 在 triton online softmax（float32 累�
 
 ### 未实施项（按审计文档优先级延后）
 
-- **第 3 批**（A6 调度节流 / F1 metrics / TP/OT p99 测量）：尾延迟与可观测性。
-- **E2/E8**（拆 attn_impl 字段 / 复用 gather_paged_kv）：结构小改，可延后。
+- **第 3 批**（A6 调度节流 / F1 metrics / TPOT p99 测量）：尾延迟与可观测性。
 - **A7/A8/B4/C4/C5**：明确推到 P6 之后或 P7 本体。
+
+### 维度 E · 代码结构与可维护性修复（2026-09-27）
+
+> E1–E8 全部修复，35/35 测试全绿（TRITON_INTERPRET=1 CPU 解释器模式）。
+
+#### E8 · 复用 gather_paged_kv ✅
+
+- **改动**：`varlen_prefill_torch` 内联的 gather KV 逻辑改为调用 `paged_attn.py::gather_paged_kv`。
+- **原因**：P4 写 `varlen_prefill_torch` 时内联重写了与 P3 `gather_paged_kv` 相同的 gather 逻辑，两份重复代码改一处忘另一处会不一致。
+- **文件**：`attention/varlen_prefill.py`
+
+#### E6 · 复活 _run_prefill 成 --prefill-mode 开关 ✅
+
+- **改动**：`EngineCore.__init__` 加 `prefill_mode: str = "batched"` 参数；`_execute` 加 per-seq 分支（逐条调 `_run_prefill`）；`create_app` + `main()` 加 `--prefill-mode {batched,per-seq}` CLI。
+- **原因**：`_run_prefill` 是 P4 初版的逐条 prefill，被 `_run_prefill_batched` 取代后变死代码。复活成开关保留对照组，bench 可跑 A/B 对比验证 varlen 拼批有效性。
+- **文件**：`engine/core.py`、`server/api.py`
+
+#### E2 · 拆 attn_impl/prefill_impl 两字段 ✅
+
+- **改动**：`AttentionMetadata` 加 `prefill_impl: str = "torch"` 字段；prefill 赋值点改用 `prefill_impl`，decode 保持 `attn_impl`；`qwen2.py` prefill varlen 路径用 `metadata.prefill_impl`。
+- **原因**：原 `attn_impl` 字段在 prefill 时塞 `prefill_impl`、decode 时塞 `attn_impl`，同一字段两种语义，读代码时必须看赋值点才知道含义。
+- **文件**：`attention/metadata.py`、`engine/core.py`、`models/qwen2.py`、`model_executor/runner.py`
+
+#### E4 · prefill 进 backend.py 注册表 ✅
+
+- **改动**：`backend.py` 加 `PREFILL_ATTN_BACKENDS` 注册表 + `get_prefill_attn()` 函数；`varlen_prefill_attention` 改用注册表替代 `if impl ==` 分支。
+- **原因**：P3 建了 `backend.py` 注册表只管 decode；P4 加 prefill 多后端时没复用注册表，写了 `if impl ==` 分支，两套后端选择机制并存。
+- **文件**：`attention/backend.py`、`attention/varlen_prefill.py`
+
+#### E7 · 补 pyproject.toml + 去 sys.path hack ✅
+
+- **改动**：新建 `pyproject.toml`（setuptools 配置，`nano_vllm` 可 `pip install -e .`）；删除 `api.py` 的 `sys.path.insert` hack 和无用 `import sys` / `from pathlib import Path`。
+- **原因**：项目从未做打包配置，`sys.path.insert` 是没装包时的 workaround，不同启动方式下可能失效。
+- **文件**：`pyproject.toml`（新建）、`server/api.py`
+
+#### E3 · core/ 改名 kvmm/ ✅
+
+- **改动**：`git mv nano_vllm/core nano_vllm/kvmm`；5 个文件的 import 路径 `nano_vllm.core` → `nano_vllm.kvmm`。
+- **原因**：`nano_vllm/core/`（BlockPool + PagedKVCache）与 `nano_vllm/engine/core.py`（EngineCore）撞名，两个 `core` 语义无关但同名，import 时易看错。`kvmm`（KV memory management）语义清晰。
+- **文件**：`nano_vllm/kvmm/`（原 `core/`）、`kvmm/paged_kv_cache.py`、`model_executor/runner.py`、`engine/scheduler.py`、`tests/test_p3_correctness.py`、`tests/test_p4_correctness.py`
+
+#### E5 · 拆 legacy_api.py ✅
+
+- **改动**：新建 `model_executor/legacy_api.py`，移入 P1 eager / P2 连续 cache / P2 静态批的实现体（`generate_eager` / `generate_cached` / `generate_batch` / `forward_last_logits`）；`runner.py` 的 `generate` P1/P2 分支和 `generate_batch` 改为薄委托，`_build_prefill_mask`/`_build_decode_mask` 删除；`_prefill`/`_decode` 保留（chunked prefill 测试直接调用）。
+- **原因**：`runner.py` 322 行混合了 P1 eager / P2 连续 cache / P3 分页 / P4 入口，职责过宽。拆出 P1/P2 到 `legacy_api.py` 后 `runner.py` 降至 ~200 行，主路径（P3+）与历史基线（P1/P2）分离。
+- **文件**：`model_executor/legacy_api.py`（新建）、`model_executor/runner.py`
