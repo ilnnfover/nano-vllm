@@ -37,11 +37,13 @@ from nano_vllm.model_executor.runner import NanoRunner
 from nano_vllm.server.api import create_app
 
 
+# P5
 def sync(device: str) -> None:
     if device == "cuda":
         torch.cuda.synchronize()
 
 
+# P5
 def make_runner(model: str, num_blocks: int, max_seq_len: int, device: str, dtype: torch.dtype, prefill_impl: str = "torch") -> NanoRunner:
     return NanoRunner(
         model, device=device, dtype=dtype,
@@ -51,6 +53,7 @@ def make_runner(model: str, num_blocks: int, max_seq_len: int, device: str, dtyp
     )
 
 
+# P5
 def make_engine(runner: NanoRunner, max_num_batched_tokens: int = 2048) -> EngineCore:
     scheduler = Scheduler(
         paged_cache=runner.paged_cache,
@@ -99,21 +102,35 @@ async def run_http(
     prompts: list[list[int]],
     max_new_tokens: int,
     model_name: str,
+    endpoint: str = "completions",
+    stream: bool = False,
 ) -> dict:
     tokenizer = app.state.tokenizer
     prompt_texts = [tokenizer.decode(p) for p in prompts]
+    path = f"/v1/{endpoint}/completions" if endpoint == "chat" else f"/v1/{endpoint}"
 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://bench") as client:
         async def one_request(text: str) -> int:
-            resp = await client.post("/v1/completions", json={
-                "model": model_name,
-                "prompt": text,
-                "max_tokens": max_new_tokens,
-                "temperature": 0.0,
-            })
-            data = resp.json()
-            return data["usage"]["completion_tokens"]
+            if endpoint == "completions":
+                body = {"model": model_name, "prompt": text,
+                        "max_tokens": max_new_tokens, "temperature": 0.0}
+            else:
+                body = {"model": model_name,
+                        "messages": [{"role": "user", "content": text}],
+                        "max_tokens": max_new_tokens, "temperature": 0.0}
+
+            if stream:
+                body["stream"] = True
+                resp = await client.post(path, json=body)
+                token_count = 0
+                async for line in resp.aiter_lines():
+                    if line.startswith("data: ") and line != "data: [DONE]":
+                        token_count += 1
+                return token_count
+            else:
+                resp = await client.post(path, json=body)
+                return resp.json()["usage"]["completion_tokens"]
 
         sync(app.state.runner.device)
         t0 = time.perf_counter()
@@ -159,41 +176,55 @@ async def bench_overhead(args) -> dict:
         max_num_batched_tokens=args.budget, prefill_impl=args.prefill_impl,
     )
 
-    # warmup
+    http_modes = [
+        ("completions", False, "completions_nonstream"),
+        ("completions", True,  "completions_stream"),
+        ("chat",        False, "chat_nonstream"),
+        ("chat",        True,  "chat_stream"),
+    ]
+
+    # warmup：直连 + 4 种 HTTP 路径
     for _ in range(args.warmup):
         run_direct(runner, prompts, args.max_new_tokens, args.budget)
-        await run_http(app, prompts, args.max_new_tokens, args.model)
+        for ep, st, _ in http_modes:
+            await run_http(app, prompts, args.max_new_tokens, args.model, ep, st)
 
-    # 正式测量
+    # 直连基线
     direct_runs = [run_direct(runner, prompts, args.max_new_tokens, args.budget) for _ in range(args.repeat)]
-    http_runs = [await run_http(app, prompts, args.max_new_tokens, args.model) for _ in range(args.repeat)]
-
     direct_agg = _aggregate(direct_runs, "throughput_tok_s")
-    http_agg = _aggregate(http_runs, "throughput_tok_s")
     direct_wall = _aggregate(direct_runs, "wall_ms")
-    http_wall = _aggregate(http_runs, "wall_ms")
 
-    ratio = http_agg["median"] / direct_agg["median"] if direct_agg["median"] > 0 else 0
-    return {
+    result = {
         "direct": {
             "throughput_tok_s": direct_agg,
             "wall_ms": direct_wall,
             "output_tokens": direct_runs[0]["output_tokens"],
             "num_requests": len(prompts),
         },
-        "http": {
+        "warmup": args.warmup,
+        "repeat": args.repeat,
+    }
+
+    # 4 种 HTTP 路径
+    for ep, st, label in http_modes:
+        http_runs = [await run_http(app, prompts, args.max_new_tokens, args.model, ep, st) for _ in range(args.repeat)]
+        http_agg = _aggregate(http_runs, "throughput_tok_s")
+        http_wall = _aggregate(http_runs, "wall_ms")
+        ratio = http_agg["median"] / direct_agg["median"] if direct_agg["median"] > 0 else 0
+        result[f"http_{label}"] = {
             "throughput_tok_s": http_agg,
             "wall_ms": http_wall,
             "output_tokens": http_runs[0]["output_tokens"],
             "num_requests": len(prompts),
-        },
-        "overhead_ratio": ratio,
-        "overhead_pct": (1 - ratio) * 100,
-        "target": ">= 0.9 (overhead < 10%)",
-        "pass": ratio >= 0.9,
-        "warmup": args.warmup,
-        "repeat": args.repeat,
-    }
+            "overhead_ratio": ratio,
+            "overhead_pct": (1 - ratio) * 100,
+            "pass": ratio >= 0.9,
+        }
+
+    all_pass = all(result[f"http_{l}"]["pass"] for _, _, l in http_modes)
+    result["target"] = ">= 0.9 (overhead < 10%)"
+    result["pass"] = all_pass
+    return result
 
 
 def main() -> None:

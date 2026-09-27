@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import json
 import sys
+from contextlib import asynccontextmanager
+
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -60,7 +62,12 @@ def create_app(
     async_engine = AsyncEngineCore(engine)
     tokenizer = AutoTokenizer.from_pretrained(model_path)
 
-    app = FastAPI(title="nano-vLLM")
+    @asynccontextmanager
+    async def lifespan(app):
+        yield
+        await async_engine.aclose()
+
+    app = FastAPI(title="nano-vLLM", lifespan=lifespan)
     app.state.async_engine = async_engine
     app.state.tokenizer = tokenizer
     app.state.runner = runner
@@ -120,9 +127,6 @@ def create_app(
             text, req.model, len(prompt_ids), len(tokens),
         ))
 
-    @app.on_event("shutdown")
-    async def shutdown():
-        await async_engine.aclose()
 
     return app
 
