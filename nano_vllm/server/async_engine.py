@@ -90,6 +90,25 @@ class AsyncEngineCore:
             self._token_queues.pop(seq.seq_id, None)
             self.engine.abort(seq.seq_id)
 
+    async def reset(self) -> None:
+        """reset 引擎状态：取消后台 task + 清空 scheduler + reset KV cache。
+
+        bench repeat 间隔离用，确保每次测量从同一干净状态开始。
+        """
+        if self._step_task is not None and not self._step_task.done():
+            self._step_task.cancel()
+            try:
+                await self._step_task
+            except asyncio.CancelledError:
+                pass
+            self._step_task = None
+        self._token_queues.clear()
+        self.engine.scheduler.waiting.clear()
+        self.engine.scheduler.running.clear()
+        self.engine.scheduler._next_seq_id = 0
+        self.engine._next_seq_id = 0
+        self.engine.runner.paged_cache.reset()
+
     async def aclose(self) -> None:
         if self._step_task is not None and not self._step_task.done():
             self._step_task.cancel()

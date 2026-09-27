@@ -107,8 +107,11 @@ async def run_http(
 ) -> dict:
     tokenizer = app.state.tokenizer
     prompt_texts = [tokenizer.decode(p) for p in prompts]
+    if endpoint == "chat":
+        prompt_texts = [f"请续写以下文本，不要停止：\n{text}" for text in prompt_texts]
     path = f"/v1/{endpoint}/completions" if endpoint == "chat" else f"/v1/{endpoint}"
 
+    await app.state.async_engine.reset()
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://bench") as client:
         async def one_request(text: str) -> int:
@@ -237,7 +240,7 @@ def main() -> None:
     p.add_argument("--max-new-tokens", type=int, default=64)
     p.add_argument("--budget", type=int, default=2048, help="max_num_batched_tokens")
     p.add_argument("--prefill-impl", default="torch", choices=["torch", "flashinfer"])
-    p.add_argument("--warmup", type=int, default=1)
+    p.add_argument("--warmup", type=int, default=3)
     p.add_argument("--repeat", type=int, default=3)
     p.add_argument("--tag", default=None)
     p.add_argument("--results-dir", default="bench/results")
