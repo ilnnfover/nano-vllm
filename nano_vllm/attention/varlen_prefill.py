@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import torch
 
-from nano_vllm.attention.paged_attn import repeat_kv
+from nano_vllm.attention.paged_attn import gather_paged_kv, repeat_kv
 
 # flashinfer workspace 复用（128MB，按 device 缓存，避免每步重复分配）
 _FLASHINFER_WORKSPACE: dict[str, torch.Tensor] = {}
@@ -106,11 +106,9 @@ def varlen_prefill_torch(
         kv_len = (len(blocks) - 1) * block_size + int(paged_kv_last_page_len[i])
 
         q_i = q[q_start:q_end]  # [q_len, num_heads, head_dim]
-        idx = torch.tensor(blocks, dtype=torch.long, device=k_cache.device)
-        k = k_cache.index_select(0, idx).reshape(-1, num_kv_heads, head_dim)[:kv_len]
-        v = v_cache.index_select(0, idx).reshape(-1, num_kv_heads, head_dim)[:kv_len]
-        k = repeat_kv(k.transpose(0, 1), n_rep)  # [num_heads, kv_len, head_dim]
-        v = repeat_kv(v.transpose(0, 1), n_rep)
+        k, v = gather_paged_kv(k_cache, v_cache, blocks, kv_len, num_kv_heads)
+        k = repeat_kv(k, n_rep)  # [num_heads, kv_len, head_dim]
+        v = repeat_kv(v, n_rep)
 
         scores = torch.einsum("qhd,hkd->hqk", q_i, k) * scaling
         pos_q = torch.arange(kv_len - q_len, kv_len, device=q.device)
@@ -177,13 +175,10 @@ def varlen_prefill_attention(
     scaling: float,
     impl: str = "torch",
 ) -> torch.Tensor:
-    """统一入口：按 impl 分派 torch / flashinfer 后端。"""
-    if impl == "flashinfer":
-        return varlen_prefill_flashinfer(
-            q, k_cache, v_cache, qo_indptr, paged_kv_indptr,
-            paged_kv_indices, paged_kv_last_page_len, num_kv_heads, scaling,
-        )
-    return varlen_prefill_torch(
+    """统一入口：通过注册表分派 torch / flashinfer 后端。"""
+    from nano_vllm.attention.backend import get_prefill_attn
+    fn = get_prefill_attn(impl)
+    return fn(
         q, k_cache, v_cache, qo_indptr, paged_kv_indptr,
         paged_kv_indices, paged_kv_last_page_len, num_kv_heads, scaling,
     )

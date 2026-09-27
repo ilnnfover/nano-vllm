@@ -21,6 +21,7 @@ class AttentionMetadata:
     block_table: list[int] | None = None
     seq_len: int = 0
     attn_impl: str = "torch"
+    prefill_impl: str = "torch"
     # P4 批量 decode: 多条序列各自的 block_table 和 seq_len
     block_tables: list[list[int]] | None = None
     seq_lens: list[int] | None = None

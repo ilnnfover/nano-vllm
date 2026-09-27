@@ -23,8 +23,8 @@ import unittest
 import torch
 
 from nano_vllm.attention.paged_attn import paged_attention_sdpa, paged_attention_torch
-from nano_vllm.core.block_pool import BlockPool
-from nano_vllm.core.paged_kv_cache import PagedKVCache
+from nano_vllm.kvmm.block_pool import BlockPool
+from nano_vllm.kvmm.paged_kv_cache import PagedKVCache
 
 MODEL = "models/Qwen2.5-0.5B-Instruct"
 INTERPRET = bool(os.environ.get("TRITON_INTERPRET"))

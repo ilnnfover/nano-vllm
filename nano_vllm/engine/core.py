@@ -23,12 +23,14 @@ class EngineCore:
         self,
         runner: NanoRunner,
         scheduler: Scheduler,
+        prefill_mode: str = "batched",
     ) -> None:
         self.runner = runner
         self.scheduler = scheduler
         self.device = runner.device
         self.dtype = runner.dtype
         self._next_seq_id = 0
+        self.prefill_mode = prefill_mode
 
     def add_request(
         self,
@@ -65,11 +67,17 @@ class EngineCore:
         decode_seqs = [s for s in scheduler_output.scheduled if not s.is_prefill]
 
         if prefill_seqs:
-            logits_map = self._run_prefill_batched(prefill_seqs)
-            for s in prefill_seqs:
-                if s.is_last_prefill_chunk:
-                    seq = s.seq
-                    sampled[seq.seq_id] = self._sample(seq, logits_map[seq.seq_id])
+            if self.prefill_mode == "per-seq":
+                for s in prefill_seqs:
+                    logits = self._run_prefill(s.seq, s.num_tokens)
+                    if s.is_last_prefill_chunk:
+                        sampled[s.seq.seq_id] = self._sample(s.seq, logits)
+            else:
+                logits_map = self._run_prefill_batched(prefill_seqs)
+                for s in prefill_seqs:
+                    if s.is_last_prefill_chunk:
+                        seq = s.seq
+                        sampled[seq.seq_id] = self._sample(seq, logits_map[seq.seq_id])
 
         if len(decode_seqs) == 1:
             seq = decode_seqs[0].seq
@@ -118,7 +126,7 @@ class EngineCore:
             slot_mapping=slot_mapping,
             block_table=seq.block_table,
             seq_len=total_seq_len,
-            attn_impl="torch",
+            prefill_impl="torch",
         )
         logits, _ = self.runner.model(
             input_ids,
@@ -171,7 +179,7 @@ class EngineCore:
             paged_kv_indptr=paged_kv_indptr,
             paged_kv_indices=paged_kv_indices,
             paged_kv_last_page_len=paged_kv_last_page_len,
-            attn_impl=self.runner.prefill_impl,
+            prefill_impl=self.runner.prefill_impl,
         )
         # 只取每条请求最后一个 token 的 logits（避免算全部 [total_q, vocab]）
         last_idx = torch.tensor(

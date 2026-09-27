@@ -11,6 +11,7 @@ import torch
 
 from nano_vllm.attention.paged_attn import paged_attention_torch
 from nano_vllm.attention.triton_paged_attn import paged_attention_triton
+from nano_vllm.attention.varlen_prefill import varlen_prefill_torch, varlen_prefill_flashinfer
 
 PagedAttnFn = Callable[
     [torch.Tensor, torch.Tensor, torch.Tensor, list[int], int, int, float],
@@ -22,8 +23,25 @@ PAGED_ATTN_BACKENDS: dict[str, PagedAttnFn] = {
     "triton": paged_attention_triton,
 }
 
+PrefillAttnFn = Callable[
+    [torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
+     torch.Tensor, torch.Tensor, int, float],
+    torch.Tensor,
+]
+
+PREFILL_ATTN_BACKENDS: dict[str, PrefillAttnFn] = {
+    "torch": varlen_prefill_torch,
+    "flashinfer": varlen_prefill_flashinfer,
+}
+
 
 def get_paged_attn(impl: str) -> PagedAttnFn:
     if impl not in PAGED_ATTN_BACKENDS:
         raise ValueError(f"未知 attn_impl={impl!r}, 可选: {sorted(PAGED_ATTN_BACKENDS)}")
     return PAGED_ATTN_BACKENDS[impl]
+
+
+def get_prefill_attn(impl: str) -> PrefillAttnFn:
+    if impl not in PREFILL_ATTN_BACKENDS:
+        raise ValueError(f"未知 prefill_impl={impl!r}, 可选: {sorted(PREFILL_ATTN_BACKENDS)}")
+    return PREFILL_ATTN_BACKENDS[impl]

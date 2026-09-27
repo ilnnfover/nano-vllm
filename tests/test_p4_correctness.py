@@ -22,7 +22,7 @@ import unittest
 
 import torch
 
-from nano_vllm.core.paged_kv_cache import PagedKVCache
+from nano_vllm.kvmm.paged_kv_cache import PagedKVCache
 from nano_vllm.engine.core import EngineCore
 from nano_vllm.engine.scheduler import Scheduler
 from nano_vllm.engine.sequence import SamplingParams

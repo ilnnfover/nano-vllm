@@ -146,7 +146,7 @@ class Attention(nn.Module):
                     metadata.paged_kv_last_page_len,
                     self.num_kv_heads,
                     self.scaling,
-                    impl=metadata.attn_impl,
+                    impl=metadata.prefill_impl,
                 )
                 out = out_flat.transpose(0, 1).unsqueeze(0)  # [1, num_heads, total_q, head_dim]
             elif metadata.seq_len > s:

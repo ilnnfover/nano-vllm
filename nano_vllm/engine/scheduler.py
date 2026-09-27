@@ -16,7 +16,7 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass, field
 
-from nano_vllm.core.paged_kv_cache import PagedKVCache
+from nano_vllm.kvmm.paged_kv_cache import PagedKVCache
 from nano_vllm.engine.sequence import Sequence, SequenceStatus
 
 

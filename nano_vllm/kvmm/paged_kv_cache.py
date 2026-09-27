@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import torch
 
-from nano_vllm.core.block_pool import BlockPool
+from nano_vllm.kvmm.block_pool import BlockPool
 
 
 def reshape_and_cache(

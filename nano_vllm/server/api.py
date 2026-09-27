@@ -8,12 +8,7 @@
 from __future__ import annotations
 
 import json
-import sys
 from contextlib import asynccontextmanager
-
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import argparse
 import asyncio
@@ -50,6 +45,7 @@ def create_app(
     max_num_batched_tokens: int = 2048,
     attn_impl: str = "torch",
     prefill_impl: str = "torch",
+    prefill_mode: str = "batched",
 ) -> FastAPI:
     dt = {"bf16": torch.bfloat16, "fp32": torch.float32}[dtype]
     runner = NanoRunner(
@@ -62,7 +58,7 @@ def create_app(
         max_num_batched_tokens=max_num_batched_tokens,
         watermark_blocks=1,
     )
-    engine = EngineCore(runner, scheduler)
+    engine = EngineCore(runner, scheduler, prefill_mode=prefill_mode)
     async_engine = AsyncEngineCore(engine)
     tokenizer = AutoTokenizer.from_pretrained(model_path)
 
@@ -159,6 +155,7 @@ def main() -> None:
     p.add_argument("--budget", type=int, default=2048)
     p.add_argument("--prefill-impl", default="torch", choices=["torch", "flashinfer"])
     p.add_argument("--attn-impl", default="torch", choices=["torch", "triton"])
+    p.add_argument("--prefill-mode", default="batched", choices=["batched", "per-seq"])
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=8000)
     args = p.parse_args()
@@ -170,7 +167,7 @@ def main() -> None:
         args.model, device=device, dtype=args.dtype,
         max_seq_len=args.max_seq_len, num_blocks=args.num_blocks,
         max_num_batched_tokens=args.budget, attn_impl=args.attn_impl,
-        prefill_impl=args.prefill_impl,
+        prefill_impl=args.prefill_impl, prefill_mode=args.prefill_mode,
     )
     uvicorn.run(app, host=args.host, port=args.port)
 

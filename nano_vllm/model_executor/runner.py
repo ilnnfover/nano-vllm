@@ -1,20 +1,26 @@
-"""P1/P2/P3 · 执行器：use_cache=False 走 P1 eager 重算（最差基线），use_cache=True 走 P2 prefill+decode。
-
-P3 起新增 use_paged=True：走分页 KV cache（BlockPool + block_table + slot_mapping），
+"""P3+ · 执行器：分页 KV cache（BlockPool + block_table + slot_mapping），
 decode attention 可选 torch 朴素 / 自研 Triton kernel（attn_impl）。
+
+P1 eager / P2 连续 cache / P2 静态批的历史入口已拆到 legacy_api.py（E5），
+本模块保留薄委托转发以维持向后兼容。
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
 from pathlib import Path
 
 import torch
 
 from nano_vllm.attention.metadata import AttentionMetadata
 from nano_vllm.config import Qwen2Config
-from nano_vllm.core.paged_kv_cache import PagedKVCache
+from nano_vllm.kvmm.paged_kv_cache import PagedKVCache
 from nano_vllm.engine.sequence import SamplingParams  # re-export for backward compat
 from nano_vllm.kv_cache import KVCache
+from nano_vllm.model_executor.legacy_api import (
+    forward_last_logits as _fwd_last_logits,
+    generate_batch as _gen_batch,
+    generate_cached as _gen_cached,
+    generate_eager as _gen_eager,
+)
 from nano_vllm.models.qwen2 import Qwen2ForCausalLM
 from nano_vllm.sample.sampler import Sampler
 
@@ -90,13 +96,11 @@ class NanoRunner:
 
     @torch.no_grad()
     def forward_last_logits(self, ids: list[int]) -> torch.Tensor:
-        t = torch.tensor([ids], dtype=torch.long, device=self.device)
-        last_idx = torch.tensor([len(ids) - 1], device=self.device)
-        logits, _ = self.model(t, last_idx=last_idx)
-        return logits[0]
+        return _fwd_last_logits(self.model, ids, self.device)
 
     @torch.no_grad()
     def _prefill(self, prompt_ids: list[int]) -> torch.Tensor:
+        """P2 连续 cache prefill（chunked prefill 测试用）。"""
         self.kv_cache.reset()
         t = torch.tensor([prompt_ids], dtype=torch.long, device=self.device)
         last_idx = torch.tensor([len(prompt_ids) - 1], device=self.device)
@@ -106,6 +110,7 @@ class NanoRunner:
 
     @torch.no_grad()
     def _decode(self, tok: int) -> torch.Tensor:
+        """P2 连续 cache decode（chunked prefill 测试用）。"""
         pos = self.kv_cache.seq_len
         t = torch.tensor([[tok]], dtype=torch.long, device=self.device)
         logits, _ = self.model(t, kv_cache=self.kv_cache, is_prefill=False, cache_seq_len=pos)
@@ -123,7 +128,7 @@ class NanoRunner:
         slot_mapping = self.paged_cache.slot_mapping(self._block_table, 0, seq_len)
         metadata = AttentionMetadata(
             is_prefill=True, slot_mapping=slot_mapping, block_table=self._block_table,
-            seq_len=seq_len, attn_impl=self.attn_impl,
+            seq_len=seq_len, prefill_impl=self.prefill_impl,
         )
         t = torch.tensor([prompt_ids], dtype=torch.long, device=self.device)
         position_ids = torch.arange(seq_len, device=self.device).unsqueeze(0)
@@ -167,10 +172,9 @@ class NanoRunner:
         use_paged: bool = False,
     ) -> list[int]:
         params = params or SamplingParams()
-        ids = list(prompt_ids)
-        out: list[int] = []
 
         if use_paged:
+            out: list[int] = []
             last_logits = self._prefill_paged(prompt_ids)
             for _ in range(params.max_new_tokens):
                 tok = self.sampler.sample(
@@ -185,41 +189,8 @@ class NanoRunner:
             return out
 
         if use_cache:
-            last_logits = self._prefill(prompt_ids)
-            for _ in range(params.max_new_tokens):
-                tok = self.sampler.sample(
-                    last_logits, temperature=params.temperature,
-                    top_k=params.top_k, top_p=params.top_p,
-                )
-                if tok in self.eos_ids:
-                    break
-                out.append(tok)
-                last_logits = self._decode(tok)
-        else:
-            for _ in range(params.max_new_tokens):
-                logits = self.forward_last_logits(ids)
-                tok = self.sampler.sample(
-                    logits, temperature=params.temperature,
-                    top_k=params.top_k, top_p=params.top_p,
-                )
-                if tok in self.eos_ids:
-                    break
-                out.append(tok)
-                ids.append(tok)
-        return out
-    def _build_prefill_mask(self, attention_mask: torch.Tensor) -> torch.Tensor:
-        b, s = attention_mask.shape
-        causal = torch.tril(torch.ones(s, s, device=attention_mask.device, dtype=torch.bool))
-        full = causal[None, None, :, :] & attention_mask[:, None, None, :].bool()
-        mask = torch.zeros(b, 1, s, s, device=attention_mask.device, dtype=self.dtype)
-        mask.masked_fill_(~full, float("-inf"))
-        return mask
-
-    def _build_decode_mask(self, valid_mask: torch.Tensor) -> torch.Tensor:
-        b, total = valid_mask.shape
-        mask = torch.zeros(b, 1, 1, total, device=valid_mask.device, dtype=self.dtype)
-        mask.masked_fill_(~valid_mask[:, None, None, :].bool(), float("-inf"))
-        return mask
+            return _gen_cached(self, prompt_ids, params)
+        return _gen_eager(self, prompt_ids, params)
 
     @torch.no_grad()
     def generate_batch(
@@ -228,95 +199,4 @@ class NanoRunner:
         params: SamplingParams | None = None,
     ) -> tuple[list[list[int]], dict]:
         params = params or SamplingParams()
-        b = len(prompts)
-        prompt_lens = [len(p) for p in prompts]
-        max_prompt = max(prompt_lens)
-
-        input_ids = torch.full((b, max_prompt), self.pad_id, dtype=torch.long, device=self.device)
-        attn = torch.zeros(b, max_prompt, device=self.device, dtype=self.dtype)
-        for i, p in enumerate(prompts):
-            input_ids[i, : len(p)] = torch.tensor(p, dtype=torch.long, device=self.device)
-            attn[i, : len(p)] = 1.0
-
-        batch_cache = KVCache(
-            num_layers=self.config.num_hidden_layers,
-            num_kv_heads=self.config.num_key_value_heads,
-            head_dim=self.config.head_dim,
-            max_seq_len=self.kv_cache.max_seq_len,
-            batch_size=b,
-            dtype=self.dtype,
-            device=self.device,
-        )
-        batch_cache.reset()
-
-        prefill_pos = torch.zeros(b, max_prompt, dtype=torch.long, device=self.device)
-        for i, l in enumerate(prompt_lens):
-            prefill_pos[i, :l] = torch.arange(l, device=self.device)
-
-        prefill_mask = self._build_prefill_mask(attn)
-        last_idx = torch.tensor([l - 1 for l in prompt_lens], device=self.device)
-        logits, _ = self.model(
-            input_ids, kv_cache=batch_cache, is_prefill=True,
-            cache_seq_len=0, attn_mask=prefill_mask, position_ids=prefill_pos,
-            last_idx=last_idx,
-        )
-        batch_cache.seq_len = max_prompt
-
-        last_logits = logits
-
-        valid_mask = attn.clone()
-        seq_lens = list(prompt_lens)
-        outs: list[list[int]] = [[] for _ in range(b)]
-        done = [False] * b
-        total_tokens = sum(prompt_lens)
-
-        for _ in range(params.max_new_tokens):
-            tokens = []
-            for i in range(b):
-                if done[i]:
-                    tokens.append(self.pad_id)
-                    continue
-                tok = self.sampler.sample(
-                    last_logits[i], temperature=params.temperature,
-                    top_k=params.top_k, top_p=params.top_p,
-                )
-                if tok in self.eos_ids:
-                    done[i] = True
-                else:
-                    outs[i].append(tok)
-                tokens.append(tok if not done[i] else self.pad_id)
-
-            if all(done):
-                break
-
-            t = torch.tensor([tokens], dtype=torch.long, device=self.device).T
-            decode_pos = torch.tensor([seq_lens], dtype=torch.long, device=self.device).T
-            new_valid = torch.tensor(
-                [[0 if done[i] else 1] for i in range(b)],
-                device=self.device, dtype=self.dtype,
-            )
-            valid_mask = torch.cat([valid_mask, new_valid], dim=1)
-            total_tokens += sum(0 if d else 1 for d in done)
-
-            decode_mask = self._build_decode_mask(valid_mask)
-            logits, _ = self.model(
-                t, kv_cache=batch_cache, is_prefill=False,
-                cache_seq_len=batch_cache.seq_len, attn_mask=decode_mask,
-                position_ids=decode_pos,
-            )
-            batch_cache.seq_len += 1
-            for i in range(b):
-                if not done[i]:
-                    seq_lens[i] += 1
-            last_logits = logits[:, -1]
-
-        waste = 1.0 - total_tokens / (b * batch_cache.seq_len) if batch_cache.seq_len > 0 else 1.0
-        stats = {
-            "batch_size": b,
-            "max_prompt_len": max_prompt,
-            "total_tokens": total_tokens,
-            "batch_slots": b * batch_cache.seq_len,
-            "padding_waste_rate": waste,
-            "kv_waste_rate": batch_cache.waste_rate,
-        }
-        return outs, stats
+        return _gen_batch(self, prompts, params)
