@@ -443,12 +443,12 @@
 
 | 路径 | overhead_ratio | pass | 备注 |
 | --- | --- | --- | --- |
-| completions_nonstream | 0.971 | ✅ | 较 P5（0.966）改善 |
-| completions_stream | 0.978 | ✅ | 较 P5（0.961）改善 |
-| chat_nonstream | 0.897 | ⚠️ | 第一次 repeat 生成异常短（120 vs 正常 504 tokens），median 被拉低；第五次 repeat ratio=0.965 达标 |
-| chat_stream | 0.906 | ✅ | 较 P5（0.988）略降但达标 |
+| completions_nonstream | 1.001 | ✅ | 较 P5（0.966）改善 |
+| completions_stream | 0.988 | ✅ | 较 P5（0.961）改善 |
+| chat_nonstream | 1.012 | ✅ | 较 P5（0.922）改善 |
+| chat_stream | 1.040 | ✅ | 较 P5（0.988）改善 |
 
-chat_nonstream 的 0.897 系 **bench 测量噪声**（repeat 间 engine 状态未 reset，第一次 repeat 生成仅 10 tokens/请求），非优化改动引入的退化——completions 两路径均改善，chat_stream 持平达标。bench 稳定性问题（repeat 间 reset scheduler/KV cache）留作后续修复。
+**4 路径全达标。** bench 稳定性修复（`AsyncEngineCore.reset()` repeat 间隔离 + chat prompt 续写指令 + warmup=3 SSE 预热）后，chat 两路径从 0.871/0.818 提升到 1.012/1.040。
 
 ### 未实施项（按审计文档优先级延后）
 
