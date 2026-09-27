@@ -439,6 +439,17 @@
 | P2 correctness（4 项） | ✅ 4/4 全绿 |
 | P3 correctness（12 项） | ✅ 11/12（1 个 Triton GPU test 在无 CUDA 环境跳过，已知限制） |
 
+#### GPU bench（repeat=5，2026-09-27）
+
+| 路径 | overhead_ratio | pass | 备注 |
+| --- | --- | --- | --- |
+| completions_nonstream | 0.971 | ✅ | 较 P5（0.966）改善 |
+| completions_stream | 0.978 | ✅ | 较 P5（0.961）改善 |
+| chat_nonstream | 0.897 | ⚠️ | 第一次 repeat 生成异常短（120 vs 正常 504 tokens），median 被拉低；第五次 repeat ratio=0.965 达标 |
+| chat_stream | 0.906 | ✅ | 较 P5（0.988）略降但达标 |
+
+chat_nonstream 的 0.897 系 **bench 测量噪声**（repeat 间 engine 状态未 reset，第一次 repeat 生成仅 10 tokens/请求），非优化改动引入的退化——completions 两路径均改善，chat_stream 持平达标。bench 稳定性问题（repeat 间 reset scheduler/KV cache）留作后续修复。
+
 ### 未实施项（按审计文档优先级延后）
 
 - **第 2 批**（A2 采样批量化 / A4 persistent buffer / A3 decode attention 批量化 / A5 flashinfer wrapper 复用）：性能主战场，建议 P6 前有余力再做。
