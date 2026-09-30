@@ -60,6 +60,14 @@ class TestP4Correctness(unittest.TestCase):
     def setUpClass(cls):
         cls.runner = make_runner()
 
+    @classmethod
+    def tearDownClass(cls):
+        # 释放 0.5B 权重，避免整仓测试套件内存叠加超限
+        import gc
+
+        del cls.runner
+        gc.collect()
+
     def setUp(self):
         self.runner.paged_cache.reset()
 

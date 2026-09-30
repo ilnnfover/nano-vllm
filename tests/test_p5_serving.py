@@ -28,6 +28,14 @@ class TestP5Serving(unittest.IsolatedAsyncioTestCase):
             max_seq_len=512, num_blocks=64, max_num_batched_tokens=512,
         )
 
+    @classmethod
+    def tearDownClass(cls):
+        # 释放 0.5B 权重，避免整仓测试套件内存叠加超限
+        import gc
+
+        del cls.app
+        gc.collect()
+
     async def _client(self):
         return httpx.AsyncClient(
             transport=httpx.ASGITransport(app=self.app),

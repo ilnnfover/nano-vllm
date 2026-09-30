@@ -42,6 +42,14 @@ class TestP2Correctness(unittest.TestCase):
         cls.prompts = make_prompts()
         cls.params = SamplingParams(temperature=0.0, max_new_tokens=16)
 
+    @classmethod
+    def tearDownClass(cls):
+        # 释放 0.5B 权重，避免整仓测试套件内存叠加超限
+        import gc
+
+        del cls.r
+        gc.collect()
+
     def test_cache_matches_eager(self):
         """batch=1: KV cache 路径与 eager 重算路径逐 token 一致"""
         for ids in self.prompts:

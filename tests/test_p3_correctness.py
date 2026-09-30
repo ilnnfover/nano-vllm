@@ -107,11 +107,11 @@ class TestPagedKVCache(unittest.TestCase):
 
 
 class TestPagedAttention(unittest.TestCase):
-    def _inputs(self, num_heads, num_kv_heads, head_dim, block_size, num_blocks, seq_len, seed):
-        g = torch.Generator().manual_seed(seed)
-        k_cache = torch.randn(num_blocks, block_size, num_kv_heads, head_dim, generator=g)
-        v_cache = torch.randn(num_blocks, block_size, num_kv_heads, head_dim, generator=g)
-        q = torch.randn(num_heads, 1, head_dim, generator=g)
+    def _inputs(self, num_heads, num_kv_heads, head_dim, block_size, num_blocks, seq_len, seed, device="cpu"):
+        g = torch.Generator(device=device).manual_seed(seed)
+        k_cache = torch.randn(num_blocks, block_size, num_kv_heads, head_dim, generator=g, device=device)
+        v_cache = torch.randn(num_blocks, block_size, num_kv_heads, head_dim, generator=g, device=device)
+        q = torch.randn(num_heads, 1, head_dim, generator=g, device=device)
         n_need = (seq_len + block_size - 1) // block_size
         return q, k_cache, v_cache, list(range(n_need))
 
@@ -128,8 +128,9 @@ class TestPagedAttention(unittest.TestCase):
             self.skipTest("需要 CUDA 或 TRITON_INTERPRET=1")
         from nano_vllm.attention.triton_paged_attn import paged_attention_triton
 
+        device = "cuda" if torch.cuda.is_available() else "cpu"
         for seq_len, bs in [(1, 16), (5, 16), (17, 16), (100, 16), (65, 64)]:
-            q, k, v, bt = self._inputs(12, 2, 128, bs, 128, seq_len, 7)
+            q, k, v, bt = self._inputs(12, 2, 128, bs, 128, seq_len, 7, device=device)
             a = paged_attention_triton(q, k, v, bt, seq_len, 2, 128**-0.5)
             b = paged_attention_torch(q, k, v, bt, seq_len, 2, 128**-0.5)
             self.assertLess((a - b).abs().max().item(), 1e-4, f"seq={seq_len} bs={bs}")
@@ -140,13 +141,14 @@ class TestPagedAttention(unittest.TestCase):
             self.skipTest("需要 CUDA 或 TRITON_INTERPRET=1")
         from nano_vllm.attention.triton_paged_attn import paged_attention_triton_batch
 
+        device = "cuda" if torch.cuda.is_available() else "cpu"
         num_heads, num_kv_heads, head_dim = 12, 2, 128
         block_size, num_blocks = 16, 256
         seq_lens = [17, 100, 5, 33]
-        g = torch.Generator().manual_seed(99)
-        k_cache = torch.randn(num_blocks, block_size, num_kv_heads, head_dim, generator=g)
-        v_cache = torch.randn(num_blocks, block_size, num_kv_heads, head_dim, generator=g)
-        q_batch = torch.randn(len(seq_lens), num_heads, 1, head_dim, generator=g)
+        g = torch.Generator(device=device).manual_seed(99)
+        k_cache = torch.randn(num_blocks, block_size, num_kv_heads, head_dim, generator=g, device=device)
+        v_cache = torch.randn(num_blocks, block_size, num_kv_heads, head_dim, generator=g, device=device)
+        q_batch = torch.randn(len(seq_lens), num_heads, 1, head_dim, generator=g, device=device)
         block_tables = []
         offset = 0
         for sl in seq_lens:
@@ -175,6 +177,14 @@ class TestPagedGenerate(unittest.TestCase):
         cls.tok = transformers.AutoTokenizer.from_pretrained(MODEL)
         cls.params = None  # 延迟到各 test 构造
         cls.runner = NanoRunner(MODEL, device="cpu", dtype=torch.float32, block_size=16, max_seq_len=256)
+
+    @classmethod
+    def tearDownClass(cls):
+        # 释放 0.5B 权重，避免整仓测试套件内存叠加超限
+        import gc
+
+        del cls.runner
+        gc.collect()
 
     def test_paged_matches_cache(self):
         from nano_vllm.model_executor.runner import SamplingParams

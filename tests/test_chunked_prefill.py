@@ -29,6 +29,14 @@ class TestChunkedPrefill(unittest.TestCase):
     def setUpClass(cls):
         cls.runner = NanoRunner(MODEL, device="cpu", dtype=torch.float32, max_seq_len=256)
 
+    @classmethod
+    def tearDownClass(cls):
+        # 释放 0.5B 权重，避免整仓测试套件内存叠加超限
+        import gc
+
+        del cls.runner
+        gc.collect()
+
     def _full_prefill(self, prompt_ids: list[int]) -> torch.Tensor:
         """一次全量 prefill，返回 last-token logits。"""
         return self.runner._prefill(prompt_ids)
