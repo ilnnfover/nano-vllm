@@ -52,11 +52,19 @@ def make_runner(model: str, num_blocks: int, max_seq_len: int, device: str, dtyp
     )
 
 
-def make_engine(runner: NanoRunner, max_num_batched_tokens: int = 2048) -> EngineCore:
+def make_engine(
+    runner: NanoRunner,
+    max_num_batched_tokens: int = 2048,
+    enable_prefix_cache: bool = True,
+    long_prefill_token_threshold: int = 0,
+    max_num_seqs: int | None = None,
+) -> EngineCore:
     scheduler = Scheduler(
         paged_cache=runner.paged_cache,
         max_num_batched_tokens=max_num_batched_tokens,
-        watermark_blocks=1,
+        enable_prefix_cache=enable_prefix_cache,
+        long_prefill_token_threshold=long_prefill_token_threshold,
+        max_num_seqs=max_num_seqs,
     )
     return EngineCore(runner, scheduler)
 
@@ -66,10 +74,16 @@ def run_p4_continuous(
     prompts: list[list[int]],
     max_new_tokens: int,
     max_num_batched_tokens: int = 2048,
+    enable_prefix_cache: bool = True,
+    long_prefill_token_threshold: int = 0,
+    max_num_seqs: int | None = None,
 ) -> dict:
     """P4 连续批：所有请求同时提交，EngineCore 循环 step。"""
     runner.paged_cache.reset()
-    engine = make_engine(runner, max_num_batched_tokens)
+    engine = make_engine(
+        runner, max_num_batched_tokens, enable_prefix_cache,
+        long_prefill_token_threshold, max_num_seqs,
+    )
     params = SamplingParams(temperature=0.0, max_new_tokens=max_new_tokens)
 
     sync(runner.device)
@@ -161,11 +175,20 @@ def bench_throughput(args) -> dict:
 
     # warmup（结果丢弃，消除 Triton JIT 编译 + CUDA context 冷启动）
     for _ in range(args.warmup):
-        run_p4_continuous(runner, prompts, args.max_new_tokens, args.budget)
+        run_p4_continuous(
+            runner, prompts, args.max_new_tokens, args.budget,
+            args.enable_prefix_cache, args.long_prefill_threshold, args.max_num_seqs,
+        )
         run_p3_static(runner, prompts, args.max_new_tokens)
 
     # 正式测量：repeat 次取中位数
-    p4_runs = [run_p4_continuous(runner, prompts, args.max_new_tokens, args.budget) for _ in range(args.repeat)]
+    p4_runs = [
+        run_p4_continuous(
+            runner, prompts, args.max_new_tokens, args.budget,
+            args.enable_prefix_cache, args.long_prefill_threshold, args.max_num_seqs,
+        )
+        for _ in range(args.repeat)
+    ]
     p3_runs = [run_p3_static(runner, prompts, args.max_new_tokens) for _ in range(args.repeat)]
 
     p4_agg = _aggregate(p4_runs, "throughput_tok_s")
@@ -224,13 +247,19 @@ def bench_tpot(args) -> dict:
         # warmup：单独 engine 跑短请求预热 kernel，不消耗正式测量额度
         for _ in range(args.warmup):
             runner.paged_cache.reset()
-            we = make_engine(runner, budget)
+            we = make_engine(
+                runner, budget, args.enable_prefix_cache,
+                args.long_prefill_threshold, args.max_num_seqs,
+            )
             wp = SamplingParams(temperature=0.0, max_new_tokens=4)
             we.generate(make_mixed_prompts(tokenizer, [128]), wp)
 
         # 正式测量：手动 step 循环，记录纯 decode step 间隔
         runner.paged_cache.reset()
-        engine = make_engine(runner, budget)
+        engine = make_engine(
+            runner, budget, args.enable_prefix_cache,
+            args.long_prefill_threshold, args.max_num_seqs,
+        )
         params = SamplingParams(temperature=0.0, max_new_tokens=args.max_new_tokens)
         seqs = [engine.add_request(p, params) for p in all_prompts]
 
@@ -283,6 +312,11 @@ def main() -> None:
     p.add_argument("--budget", type=int, default=2048, help="max_num_batched_tokens")
     p.add_argument("--prefill-impl", default="torch", choices=["torch", "flashinfer"], help="prefill attention 后端")
     p.add_argument("--attn-impl", default="torch", choices=["torch", "triton"], help="decode attention 后端")
+    p.add_argument("--no-prefix-cache", dest="enable_prefix_cache", action="store_false",
+                   default=True, help="关闭 P6 前缀缓存（默认开启）")
+    p.add_argument("--long-prefill-threshold", type=int, default=0,
+                   help="A6 单请求一步最多 prefill token 数（0 = 关闭，与 vLLM 默认一致）")
+    p.add_argument("--max-num-seqs", type=int, default=None, help="A6 同批运行请求上限（缺省不限）")
     p.add_argument("--warmup", type=int, default=1, help="预热轮数（结果丢弃，消除 Triton JIT 冷启动）")
     p.add_argument("--repeat", type=int, default=3, help="测量轮数（取中位数消除运行间方差）")
     p.add_argument("--tpot-test", action="store_true", help="跑 TPOT p99 对比测试")
@@ -301,6 +335,9 @@ def main() -> None:
 
     results["model"] = args.model
     results["dtype"] = args.dtype
+    # A6 节流阀参数（便于 A/B 对照时追溯口径）
+    results["long_prefill_threshold"] = args.long_prefill_threshold
+    results["max_num_seqs"] = args.max_num_seqs
 
     out_path = results_dir / f"p4_bench_{tag}.json"
     out_path.write_text(json.dumps(results, indent=2, ensure_ascii=False))

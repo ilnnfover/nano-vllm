@@ -29,6 +29,8 @@ import numpy as np
 import torch
 import transformers
 
+from nano_vllm.sample.sampler import Sampler
+
 
 class HFBackend:
     def __init__(self, model_path: str, device: str, dtype: torch.dtype) -> None:
@@ -94,13 +96,16 @@ def run_one(backend, prompt_ids: list[int], output_len: int, device: str) -> dic
     if device == "cuda":
         torch.cuda.synchronize()
 
+    # D2：与 serving 同一条采样路径（greedy 时 Sampler 内部即 argmax，数字不变）
+    sampler = Sampler(device)
+
     t0 = time.perf_counter()
     last = backend.prefill(prompt_ids)
     if device == "cuda":
         torch.cuda.synchronize()
     prefill_ms = (time.perf_counter() - t0) * 1e3
 
-    next_tok = int(last.argmax())
+    next_tok = sampler.sample(last, temperature=0.0)
     decode_ms = []
     gen = [next_tok]
     for _ in range(output_len - 1):
@@ -109,7 +114,7 @@ def run_one(backend, prompt_ids: list[int], output_len: int, device: str) -> dic
         if device == "cuda":
             torch.cuda.synchronize()
         decode_ms.append((time.perf_counter() - t1) * 1e3)
-        next_tok = int(last.argmax())
+        next_tok = sampler.sample(last, temperature=0.0)
         gen.append(next_tok)
 
     return {

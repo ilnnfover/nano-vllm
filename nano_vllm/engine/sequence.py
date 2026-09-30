@@ -1,4 +1,4 @@
-"""P4 · Sequence：请求的生命周期数据类。
+"""P4/P6 · Sequence：请求的生命周期数据类。
 
 对应 vLLM 的 Request + RequestStatus，但大幅简化：
   - 三态状态机 WAITING / RUNNING / FINISHED（vLLM 有 PREEMPTED/SWAPPED 等）
@@ -9,6 +9,13 @@
   - num_computed_tokens: prefill chunk 进度（0 → len(prompt) 表示 prefill 完成）
   - block_table: 逻辑块 → 物理块编号（P3 PagedKVCache 用）
   - output_token_ids: 已生成的 token（decode 产出）
+
+P6 前缀缓存扩展:
+  - prefix_cache_done: 是否已做前缀查找（首次 schedule 做一次，抢占重置后重做）
+  - num_registered_blocks: 滚动链已注册 hash 的块数（增量注册，避免重复算 hash）
+  - last_block_hash: 滚动链最后一块的 hash（register_blocks 的 prev_hash 参数）
+  - prefix_cache_extra_keys: 请求级额外 hash key（预留 LoRA adapter id / 多模态 hash 等
+    「token 相同但 KV 不该共享」的标识；默认空 = 无额外约束）
 """
 from __future__ import annotations
 
@@ -44,6 +51,13 @@ class Sequence:
     num_computed_tokens: int = 0
     output_token_ids: list[int] = field(default_factory=list)
 
+    # P6 前缀缓存：滚动链状态 + 查找标记
+    prefix_cache_done: bool = False
+    num_registered_blocks: int = 0
+    last_block_hash: bytes | None = None
+    # P6 前缀缓存：请求级额外 hash key，需**顺序稳定**（预留 LoRA / 多模态等场景）
+    prefix_cache_extra_keys: tuple = ()
+
     @property
     def num_prompt_tokens(self) -> int:
         return len(self.prompt_token_ids)
@@ -74,11 +88,18 @@ class Sequence:
         self.output_token_ids.append(token_id)
 
     def reset_for_preemption(self) -> None:
-        """抢占后重置：从头 recompute（Branch 2）。"""
+        """抢占后重置：从头 recompute（Branch 2）。
+
+        P6: 前缀缓存状态也重置——重调度时重新查找命中（大概率命中自己刚释放的前缀块，
+        recompute 降为只重算未命中部分）。block_table 清空，已注册 hash 信息作废。
+        """
         self.num_computed_tokens = 0
         self.output_token_ids.clear()
         self.block_table.clear()
         self.status = SequenceStatus.WAITING
+        self.prefix_cache_done = False
+        self.num_registered_blocks = 0
+        self.last_block_hash = None
 
     def finish(self) -> None:
         self.status = SequenceStatus.FINISHED
@@ -87,5 +108,6 @@ class Sequence:
         return (
             f"Sequence(id={self.seq_id}, status={self.status.name}, "
             f"prompt={self.num_prompt_tokens}, output={len(self.output_token_ids)}, "
-            f"computed={self.num_computed_tokens})"
+            f"computed={self.num_computed_tokens}, "
+            f"registered={self.num_registered_blocks})"
         )

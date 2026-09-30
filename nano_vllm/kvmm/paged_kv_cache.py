@@ -121,6 +121,15 @@ class PagedKVCache:
         v = v.reshape(-1, self.num_kv_heads, self.head_dim).transpose(0, 1)
         return k, v
 
+    def copy_block(self, src_id: int, dst_id: int) -> None:
+        """整块 KV 复制（COW 用）：跨所有层把 src_id 块的 KV 拷到 dst_id 块。
+
+        k/v_cache 布局 [num_layers, num_blocks, block_size, num_kv_heads, head_dim]，
+        切片 [:, src_id] 得到该块在所有层上的 KV，用 .copy_() 原地拷贝避免中间分配。
+        """
+        self.k_cache[:, dst_id].copy_(self.k_cache[:, src_id])
+        self.v_cache[:, dst_id].copy_(self.v_cache[:, src_id])
+
     def free(self, block_table: list[int]) -> None:
         self.pool.free_n(block_table)
 

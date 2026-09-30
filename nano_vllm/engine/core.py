@@ -9,6 +9,8 @@
 """
 from __future__ import annotations
 
+import os
+
 import torch
 
 from nano_vllm.attention.metadata import AttentionMetadata
@@ -19,12 +21,68 @@ from nano_vllm.engine.stats import EngineCoreStats
 from nano_vllm.model_executor.runner import NanoRunner
 
 
+def validate_batch_metadata(
+    *,
+    num_input_tokens: int,
+    num_slot_mappings: int,
+    kv_lens: list[int],
+    block_tables: list[list[int]],
+    block_size: int,
+    qo_indptr_last: int | None = None,
+    max_position_embeddings: int | None = None,
+) -> None:
+    """校验一个 step 的批元数据自洽（D4 守卫）。
+
+    背景: P3 踩坑 1/2 —— 块表 padding 读到脏块、末块半满未截断 → 直接 NaN。
+    P6 引入块共享（ref_cnt>1）后，越界写会**污染另一个请求的 KV**，症状是
+    「别人的输出变了」而不报错、不 NaN。这里把长度/容量不自洽变成立刻 raise，
+    把静默算错转成显式失败。
+
+    Raises:
+        ValueError: 任一项不自洽。
+    """
+    if num_slot_mappings != num_input_tokens:
+        raise ValueError(
+            f"slot_mapping 长度 {num_slot_mappings} != input token 数 {num_input_tokens}"
+        )
+    if qo_indptr_last is not None and qo_indptr_last != num_input_tokens:
+        raise ValueError(
+            f"qo_indptr 末值 {qo_indptr_last} != input token 数 {num_input_tokens}"
+        )
+    if len(kv_lens) != len(block_tables):
+        raise ValueError(
+            f"kv_lens 条数 {len(kv_lens)} != block_tables 条数 {len(block_tables)}"
+        )
+    for i, (kv_len, table) in enumerate(zip(kv_lens, block_tables)):
+        capacity = len(table) * block_size
+        if kv_len > capacity:
+            raise ValueError(
+                f"请求 #{i} 的 kv_len={kv_len} 超出块表容量 {capacity}"
+                f"（{len(table)} 块 × {block_size}），会读到脏块/越界写"
+            )
+    if max_position_embeddings is not None and kv_lens:
+        longest = max(kv_lens)
+        if longest > max_position_embeddings:
+            raise ValueError(
+                f"kv_len 最大值 {longest} 超出 max_position_embeddings {max_position_embeddings}"
+            )
+
+
+def check_finite(tensor: torch.Tensor, what: str) -> None:
+    """NaN/Inf 守卫：在数值越界产生处暴露，而不是等到采样出垃圾 token。"""
+    if torch.isnan(tensor).any() or torch.isinf(tensor).any():
+        raise RuntimeError(
+            f"{what} 出现 NaN/Inf，优先怀疑块表越界或末块未截断（P3 踩坑 1/2）"
+        )
+
+
 class EngineCore:
     def __init__(
         self,
         runner: NanoRunner,
         scheduler: Scheduler,
         prefill_mode: str = "batched",
+        debug: bool | None = None,
     ) -> None:
         self.runner = runner
         self.scheduler = scheduler
@@ -32,6 +90,8 @@ class EngineCore:
         self.dtype = runner.dtype
         self._next_seq_id = 0
         self.prefill_mode = prefill_mode
+        # D4：debug 下额外做 logits NaN/Inf 检查（shape 断言始终开启，代价可忽略）
+        self.debug = bool(os.environ.get("NANO_VLLM_DEBUG")) if debug is None else debug
         self.stats = EngineCoreStats()
 
     def add_request(
@@ -70,6 +130,11 @@ class EngineCore:
             waste_rate=self.scheduler.waste_rate,
             preempt_count=len(scheduler_output.preempted_seq_ids),
             tokens_generated=len(sampled),
+            prefix_cache_hit_rate=self.scheduler.prefix_cache_hit_rate,
+            prefix_cache_lookups=self.scheduler.prefix_lookups,
+            prefix_cache_query_tokens=self.scheduler.prefix_query_tokens,
+            prefix_cache_hit_tokens=self.scheduler.prefix_hit_tokens,
+            prefix_cache_hit_blocks=self.scheduler.prefix_hit_blocks,
         )
         return finished, sampled
 
@@ -134,6 +199,14 @@ class EngineCore:
         slot_mapping = self.runner.paged_cache.slot_mapping(
             seq.block_table, chunk_start, num_tokens
         )
+        validate_batch_metadata(
+            num_input_tokens=len(chunk_ids),
+            num_slot_mappings=slot_mapping.numel(),
+            kv_lens=[total_seq_len],
+            block_tables=[seq.block_table],
+            block_size=self.runner.paged_cache.block_size,
+            max_position_embeddings=self.runner.config.max_position_embeddings,
+        )
         metadata = AttentionMetadata(
             is_prefill=True,
             slot_mapping=slot_mapping,
@@ -147,6 +220,8 @@ class EngineCore:
             metadata=metadata,
             position_ids=position_ids,
         )
+        if self.debug:
+            check_finite(logits, "per-seq prefill logits")
         return logits[0, -1]
 
     @torch.no_grad()
@@ -182,6 +257,15 @@ class EngineCore:
         position_ids_t = torch.tensor([position_ids], device=self.device)
         slot_mapping = torch.cat(slot_mappings)
         qo_indptr_t = torch.tensor(qo_indptr, dtype=torch.int32, device=self.device)
+        validate_batch_metadata(
+            num_input_tokens=len(input_ids),
+            num_slot_mappings=slot_mapping.numel(),
+            kv_lens=kv_lens,
+            block_tables=block_tables,
+            block_size=self.runner.paged_cache.block_size,
+            qo_indptr_last=qo_indptr[-1],
+            max_position_embeddings=self.runner.config.max_position_embeddings,
+        )
         paged_kv_indptr, paged_kv_indices, paged_kv_last_page_len = build_paged_kv_metadata(
             block_tables, kv_lens, self.runner.paged_cache.block_size, self.device,
         )
@@ -206,6 +290,8 @@ class EngineCore:
             position_ids=position_ids_t,
             last_idx=last_idx,
         )
+        if self.debug:
+            check_finite(logits, "batched prefill logits")
         return {seq.seq_id: logits[i] for i, seq in enumerate(seqs)}
 
     @torch.no_grad()
@@ -220,6 +306,14 @@ class EngineCore:
         slot_mapping = self.runner.paged_cache.slot_mapping(
             seq.block_table, pos, 1
         )
+        validate_batch_metadata(
+            num_input_tokens=1,
+            num_slot_mappings=slot_mapping.numel(),
+            kv_lens=[new_seq_len],
+            block_tables=[seq.block_table],
+            block_size=self.runner.paged_cache.block_size,
+            max_position_embeddings=self.runner.config.max_position_embeddings,
+        )
         metadata = AttentionMetadata(
             is_prefill=False,
             slot_mapping=slot_mapping,
@@ -233,6 +327,8 @@ class EngineCore:
             metadata=metadata,
             position_ids=position_ids,
         )
+        if self.debug:
+            check_finite(logits, "single decode logits")
         return logits[0, -1]
 
     @torch.no_grad()
@@ -256,6 +352,14 @@ class EngineCore:
         slot_mapping = torch.cat(slot_mappings)
         block_tables = [seq.block_table for seq in seqs]
         seq_lens = [seq.num_computed_tokens + 1 for seq in seqs]
+        validate_batch_metadata(
+            num_input_tokens=b,
+            num_slot_mappings=slot_mapping.numel(),
+            kv_lens=seq_lens,
+            block_tables=block_tables,
+            block_size=self.runner.paged_cache.block_size,
+            max_position_embeddings=self.runner.config.max_position_embeddings,
+        )
         metadata = AttentionMetadata(
             is_prefill=False,
             slot_mapping=slot_mapping,
@@ -269,6 +373,8 @@ class EngineCore:
             metadata=metadata,
             position_ids=position_ids,
         )
+        if self.debug:
+            check_finite(logits, "batched decode logits")
         return [logits[i, -1] for i in range(b)]
 
     def generate(

@@ -1,0 +1,225 @@
+{
+  "model": "models/Qwen2.5-0.5B-Instruct",
+  "dtype": "fp32",
+  "device": "cpu",
+  "block_size": 16,
+  "num_blocks": 2049,
+  "max_seq_len": 644,
+  "budget": 512,
+  "attn_impl": "torch",
+  "warmup": 0,
+  "hit_rate_mode": {
+    "mode": "hit-rate",
+    "suffix_len": 64,
+    "warm_requests": 2,
+    "max_new_tokens": 4,
+    "sweep": [
+      {
+        "prefix_len": 64,
+        "prefix_len_tokens": 64,
+        "warm_hit_ratio": 0.5,
+        "cache": {
+          "ttfts_ms": [
+            374.44581399904564,
+            192.4263199980487,
+            199.5027470002242
+          ],
+          "ttft_cold_ms": 374.44581399904564,
+          "ttft_warm_p50_ms": 195.96453349913645,
+          "ttft_warm_p99_ms": 199.43198273020244,
+          "hit_rate": 0.3333333333333333,
+          "hit_tokens": 128,
+          "query_tokens": 384,
+          "lookups": 3,
+          "preempt_count": 0
+        },
+        "nocache": {
+          "ttfts_ms": [
+            337.54858300017077,
+            336.4084160020866,
+            332.50148899969645
+          ],
+          "ttft_cold_ms": 337.54858300017077,
+          "ttft_warm_p50_ms": 334.4549525008915,
+          "ttft_warm_p99_ms": 336.3693467320627,
+          "hit_rate": 0.0,
+          "hit_tokens": 0,
+          "query_tokens": 0,
+          "lookups": 0,
+          "preempt_count": 0
+        },
+        "ttft_speedup_warm": 1.706711650975177
+      },
+      {
+        "prefix_len": 128,
+        "prefix_len_tokens": 128,
+        "warm_hit_ratio": 0.6666666666666666,
+        "cache": {
+          "ttfts_ms": [
+            474.0791990006983,
+            193.37966099919868,
+            191.8248889996903
+          ],
+          "ttft_cold_ms": 474.0791990006983,
+          "ttft_warm_p50_ms": 192.6022749994445,
+          "ttft_warm_p99_ms": 193.3641132792036,
+          "hit_rate": 0.4444444444444444,
+          "hit_tokens": 256,
+          "query_tokens": 576,
+          "lookups": 3,
+          "preempt_count": 0
+        },
+        "nocache": {
+          "ttfts_ms": [
+            475.67790299945045,
+            453.41809399906197,
+            452.9734410025412
+          ],
+          "ttft_cold_ms": 475.67790299945045,
+          "ttft_warm_p50_ms": 453.1957675008016,
+          "ttft_warm_p99_ms": 453.41364746909676,
+          "hit_rate": 0.0,
+          "hit_tokens": 0,
+          "query_tokens": 0,
+          "lookups": 0,
+          "preempt_count": 0
+        },
+        "ttft_speedup_warm": 2.3530135742275564
+      },
+      {
+        "prefix_len": 256,
+        "prefix_len_tokens": 256,
+        "warm_hit_ratio": 0.8,
+        "cache": {
+          "ttfts_ms": [
+            704.8481189995073,
+            189.43576300080167,
+            189.16490899937344
+          ],
+          "ttft_cold_ms": 704.8481189995073,
+          "ttft_warm_p50_ms": 189.30033600008755,
+          "ttft_warm_p99_ms": 189.4330544607874,
+          "hit_rate": 0.5333333333333333,
+          "hit_tokens": 512,
+          "query_tokens": 960,
+          "lookups": 3,
+          "preempt_count": 0
+        },
+        "nocache": {
+          "ttfts_ms": [
+            723.6046969992458,
+            713.8227850009571,
+            717.2120400027779
+          ],
+          "ttft_cold_ms": 723.6046969992458,
+          "ttft_warm_p50_ms": 715.5174125018675,
+          "ttft_warm_p99_ms": 717.1781474527597,
+          "hit_rate": 0.0,
+          "hit_tokens": 0,
+          "query_tokens": 0,
+          "lookups": 0,
+          "preempt_count": 0
+        },
+        "ttft_speedup_warm": 3.779800013147027
+      },
+      {
+        "prefix_len": 512,
+        "prefix_len_tokens": 512,
+        "warm_hit_ratio": 0.8888888888888888,
+        "cache": {
+          "ttfts_ms": [
+            1368.7291570022353,
+            213.46785499918042,
+            197.5298150027811
+          ],
+          "ttft_cold_ms": 1368.7291570022353,
+          "ttft_warm_p50_ms": 205.49883500098076,
+          "ttft_warm_p99_ms": 213.30847459921642,
+          "hit_rate": 0.5925925925925926,
+          "hit_tokens": 1024,
+          "query_tokens": 1728,
+          "lookups": 3,
+          "preempt_count": 0
+        },
+        "nocache": {
+          "ttfts_ms": [
+            1337.5638629986497,
+            1319.443926000531,
+            1368.8896139974531
+          ],
+          "ttft_cold_ms": 1337.5638629986497,
+          "ttft_warm_p50_ms": 1344.166769998992,
+          "ttft_warm_p99_ms": 1368.395157117484,
+          "hit_rate": 0.0,
+          "hit_tokens": 0,
+          "query_tokens": 0,
+          "lookups": 0,
+          "preempt_count": 0
+        },
+        "ttft_speedup_warm": 6.540994599762947
+      }
+    ]
+  },
+  "replay_mode": {
+    "mode": "replay",
+    "num_conversations": 2,
+    "turns": 3,
+    "system_len": 64,
+    "turn_len": 32,
+    "max_new_tokens": 4,
+    "cache": {
+      "wall_ms": 2107.554900998366,
+      "output_tokens": 24,
+      "throughput_tok_s": 11.387603705427082,
+      "ttft_p50_ms": 115.21860399989237,
+      "ttft_p99_ms": 231.26101880152422,
+      "ttft_by_turn_ms": [
+        [
+          237.13488200155552,
+          107.57830299917259
+        ],
+        [
+          119.65761800092878,
+          116.39755600117496
+        ],
+        [
+          114.03965199860977,
+          113.61230399779743
+        ]
+      ],
+      "hit_rate": 0.6666666666666666,
+      "hit_tokens": 512,
+      "query_tokens": 768,
+      "lookups": 6,
+      "preempt_count": 0
+    },
+    "nocache": {
+      "wall_ms": 3083.9934940013336,
+      "output_tokens": 24,
+      "throughput_tok_s": 7.7821175844509165,
+      "ttft_p50_ms": 311.45343049865915,
+      "ttft_p99_ms": 367.94437160187954,
+      "ttft_by_turn_ms": [
+        [
+          239.45223100236035,
+          243.13962099768105
+        ],
+        [
+          308.5568679998687,
+          314.3499929974496
+        ],
+        [
+          369.0901270019822,
+          346.1750189999293
+        ]
+      ],
+      "hit_rate": 0.0,
+      "hit_tokens": 0,
+      "query_tokens": 0,
+      "lookups": 0,
+      "preempt_count": 0
+    },
+    "wall_speedup": 1.4633039891584416,
+    "ttft_p50_speedup": 2.7031522660954135
+  }
+}

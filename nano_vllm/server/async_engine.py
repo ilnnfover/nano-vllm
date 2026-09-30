@@ -109,6 +109,7 @@ class AsyncEngineCore:
         self.engine.scheduler._next_seq_id = 0
         self.engine._next_seq_id = 0
         self.engine.runner.paged_cache.reset()
+        self.engine.scheduler.reset_prefix_stats()
         self.engine.stats = EngineCoreStats()
 
     async def aclose(self) -> None:

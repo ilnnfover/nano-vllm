@@ -54,11 +54,15 @@ def make_runner(model: str, num_blocks: int, max_seq_len: int, device: str, dtyp
 
 
 # P5
-def make_engine(runner: NanoRunner, max_num_batched_tokens: int = 2048) -> EngineCore:
+def make_engine(
+    runner: NanoRunner,
+    max_num_batched_tokens: int = 2048,
+    enable_prefix_cache: bool = True,
+) -> EngineCore:
     scheduler = Scheduler(
         paged_cache=runner.paged_cache,
         max_num_batched_tokens=max_num_batched_tokens,
-        watermark_blocks=1,
+        enable_prefix_cache=enable_prefix_cache,
     )
     return EngineCore(runner, scheduler)
 
@@ -76,9 +80,10 @@ def run_direct(
     prompts: list[list[int]],
     max_new_tokens: int,
     max_num_batched_tokens: int = 2048,
+    enable_prefix_cache: bool = True,
 ) -> dict:
     runner.paged_cache.reset()
-    engine = make_engine(runner, max_num_batched_tokens)
+    engine = make_engine(runner, max_num_batched_tokens, enable_prefix_cache)
     params = SamplingParams(temperature=0.0, max_new_tokens=max_new_tokens)
 
     sync(runner.device)
@@ -178,6 +183,7 @@ async def bench_overhead(args) -> dict:
         max_seq_len=max_seq_len, num_blocks=num_blocks,
         max_num_batched_tokens=args.budget, attn_impl=args.attn_impl,
         prefill_impl=args.prefill_impl,
+        enable_prefix_cache=args.enable_prefix_cache,
     )
 
     http_modes = [
@@ -189,12 +195,12 @@ async def bench_overhead(args) -> dict:
 
     # warmup：直连 + 4 种 HTTP 路径
     for _ in range(args.warmup):
-        run_direct(runner, prompts, args.max_new_tokens, args.budget)
+        run_direct(runner, prompts, args.max_new_tokens, args.budget, args.enable_prefix_cache)
         for ep, st, _ in http_modes:
             await run_http(app, prompts, args.max_new_tokens, args.model, ep, st)
 
     # 直连基线
-    direct_runs = [run_direct(runner, prompts, args.max_new_tokens, args.budget) for _ in range(args.repeat)]
+    direct_runs = [run_direct(runner, prompts, args.max_new_tokens, args.budget, args.enable_prefix_cache) for _ in range(args.repeat)]
     direct_agg = _aggregate(direct_runs, "throughput_tok_s")
     direct_wall = _aggregate(direct_runs, "wall_ms")
 
@@ -242,6 +248,8 @@ def main() -> None:
     p.add_argument("--budget", type=int, default=2048, help="max_num_batched_tokens")
     p.add_argument("--prefill-impl", default="torch", choices=["torch", "flashinfer"])
     p.add_argument("--attn-impl", default="torch", choices=["torch", "triton"])
+    p.add_argument("--no-prefix-cache", dest="enable_prefix_cache", action="store_false",
+                   default=True, help="关闭 P6 前缀缓存（默认开启）")
     p.add_argument("--warmup", type=int, default=3)
     p.add_argument("--repeat", type=int, default=3)
     p.add_argument("--tag", default=None)

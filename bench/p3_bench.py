@@ -59,7 +59,7 @@ def run_block_size(args, device: str, dtype: torch.dtype) -> dict:
         ttft, logits = timed(lambda: r._prefill_paged(ids), device)
         decode_ms = []
         for _ in range(args.decode_len):
-            dt, logits = timed(lambda lg=logits: r._decode_paged(int(lg.argmax())), device)
+            dt, logits = timed(lambda lg=logits: r._decode_paged(r.sampler.sample(lg, temperature=0.0)), device)
             decode_ms.append(dt)
         peak = torch.cuda.max_memory_allocated() / 2**30 if device == "cuda" else 0.0
         tpot = statistics.mean(decode_ms)
@@ -100,7 +100,7 @@ def run_kernel(args, device: str, dtype: torch.dtype) -> dict:
         logits = r._prefill_paged(ids)
         dts = []
         for _ in range(args.repeat):
-            dt, logits = timed(lambda lg=logits: r._decode_paged(int(lg.argmax())), device)
+            dt, logits = timed(lambda lg=logits: r._decode_paged(r.sampler.sample(lg, temperature=0.0)), device)
             dts.append(dt)
         row["torch_ms"] = statistics.median(dts)
         r._free_paged()
@@ -110,7 +110,7 @@ def run_kernel(args, device: str, dtype: torch.dtype) -> dict:
             logits = r._prefill_paged(ids)
             dts = []
             for _ in range(args.repeat):
-                dt, logits = timed(lambda lg=logits: r._decode_paged(int(lg.argmax())), device)
+                dt, logits = timed(lambda lg=logits: r._decode_paged(r.sampler.sample(lg, temperature=0.0)), device)
                 dts.append(dt)
             row["triton_ms"] = statistics.median(dts)
             row["speedup_vs_torch"] = row["torch_ms"] / row["triton_ms"]

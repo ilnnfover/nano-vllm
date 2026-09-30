@@ -46,6 +46,10 @@ def create_app(
     attn_impl: str = "torch",
     prefill_impl: str = "torch",
     prefill_mode: str = "batched",
+    enable_prefix_cache: bool = True,
+    max_num_seqs: int | None = None,
+    long_prefill_token_threshold: int = 0,
+    debug: bool | None = None,
 ) -> FastAPI:
     dt = {"bf16": torch.bfloat16, "fp32": torch.float32}[dtype]
     runner = NanoRunner(
@@ -56,9 +60,11 @@ def create_app(
     scheduler = Scheduler(
         paged_cache=runner.paged_cache,
         max_num_batched_tokens=max_num_batched_tokens,
-        watermark_blocks=1,
+        max_num_seqs=max_num_seqs,
+        long_prefill_token_threshold=long_prefill_token_threshold,
+        enable_prefix_cache=enable_prefix_cache,
     )
-    engine = EngineCore(runner, scheduler, prefill_mode=prefill_mode)
+    engine = EngineCore(runner, scheduler, prefill_mode=prefill_mode, debug=debug)
     async_engine = AsyncEngineCore(engine)
     tokenizer = AutoTokenizer.from_pretrained(model_path)
 
@@ -156,6 +162,14 @@ def main() -> None:
     p.add_argument("--prefill-impl", default="torch", choices=["torch", "flashinfer"])
     p.add_argument("--attn-impl", default="torch", choices=["torch", "triton"])
     p.add_argument("--prefill-mode", default="batched", choices=["batched", "per-seq"])
+    p.add_argument("--no-prefix-cache", dest="enable_prefix_cache", action="store_false",
+                   default=True, help="关闭 P6 前缀缓存（默认开启）")
+    p.add_argument("--max-num-seqs", type=int, default=None,
+                   help="A6 同批运行请求上限（缺省不限）")
+    p.add_argument("--long-prefill-threshold", type=int, default=0,
+                   help="A6 单请求一步最多 prefill token 数（0 = 关闭，与 vLLM 默认一致）")
+    p.add_argument("--debug", action="store_true", default=None,
+                   help="D4 开启 NaN/Inf 检查（shape 守卫始终开启）")
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=8000)
     args = p.parse_args()
@@ -168,6 +182,10 @@ def main() -> None:
         max_seq_len=args.max_seq_len, num_blocks=args.num_blocks,
         max_num_batched_tokens=args.budget, attn_impl=args.attn_impl,
         prefill_impl=args.prefill_impl, prefill_mode=args.prefill_mode,
+        enable_prefix_cache=args.enable_prefix_cache,
+        max_num_seqs=args.max_num_seqs,
+        long_prefill_token_threshold=args.long_prefill_threshold,
+        debug=args.debug,
     )
     uvicorn.run(app, host=args.host, port=args.port)
 

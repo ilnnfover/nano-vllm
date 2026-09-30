@@ -69,7 +69,8 @@ def main() -> None:
     if device == "cuda":
         torch.cuda.reset_peak_memory_stats()
     gen = []
-    tok = int(logits.argmax())
+    # D2：与 serving 同一条采样路径（greedy 时 Sampler 内部即 argmax，数字不变）
+    tok = r.sampler.sample(logits, temperature=0.0)
     decode_ms = []
     for _ in range(args.decode_len):
         if device == "cuda":
@@ -79,7 +80,7 @@ def main() -> None:
         if device == "cuda":
             torch.cuda.synchronize()
         decode_ms.append((time.perf_counter() - t1) * 1e3)
-        tok = int(logits.argmax())
+        tok = r.sampler.sample(logits, temperature=0.0)
         gen.append(tok)
     decode_peak = torch.cuda.max_memory_allocated() / 2**30 if device == "cuda" else 0.0
 

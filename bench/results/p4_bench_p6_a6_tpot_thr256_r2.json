@@ -1,0 +1,26 @@
+{
+  "chunked_512": {
+    "wall_ms": 5413.829557001009,
+    "budget": 512,
+    "output_tokens": 320,
+    "tpot_p50_ms": 33.917608998308424,
+    "tpot_p99_ms": 48.97136837898871,
+    "num_decode_steps": 63
+  },
+  "non_chunked_65536": {
+    "wall_ms": 5473.0023670017545,
+    "budget": 65536,
+    "output_tokens": 320,
+    "tpot_p50_ms": 34.7168900007091,
+    "tpot_p99_ms": 51.9876158178522,
+    "num_decode_steps": 63
+  },
+  "warmup": 1,
+  "tpot_ratio_p99": 0.9419814240100671,
+  "target": "chunked p99 < 2× non_chunked p99",
+  "pass": true,
+  "model": "models/Qwen2.5-1.5B-Instruct",
+  "dtype": "bf16",
+  "long_prefill_threshold": 256,
+  "max_num_seqs": null
+}
