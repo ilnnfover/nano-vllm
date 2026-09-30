@@ -124,10 +124,14 @@ golden/
 - **Benchmark**：`run_local.py` 直连 vs HTTP 两条路径的吞吐对比
 
 ### P6 · Prefix Caching 与 COW（推荐，面试高频）
-- **必须实现**：块级滚动 hash（含 extra keys：salt/ LoRA 位预留概念）；hash→block 索引 + LRU 淘汰；命中块复用（跳过重算）；引用计数 + copy-on-write（多请求共享尾部块被追加时）；调度器接入 `get_computed_blocks` / `allocate_slots`
-- **参考源码**：`vllm/v1/core/kv_cache_utils.py`（hash）、`vllm/v1/core/block_pool.py`（COW/evict）、`kv_cache_manager.py`
+- **必须实现**：块级滚动 hash（含 extra keys：salt / LoRA 位预留概念）；hash→block 索引 + LRU 淘汰；命中块复用（跳过重算）；引用计数 + copy-on-write（**2026-09-30 修订：仅 partial 命中时触发，纯 Transformer 默认配置下不触发，见完成标准**）；调度器接入 `get_computed_blocks` / `allocate_slots`
+- **参考源码**：`vllm/v1/core/kv_cache_utils.py`（hash）、`vllm/v1/core/block_pool.py`（hash 索引 / evict / `move_block_hashes` / `cache_partial_block`）、`vllm/v1/core/single_type_kv_cache_manager.py`（**COW 决策真正所在**）、`kv_cache_manager.py`
 - **验证产出**：命中率统计埋点；多轮对话 + 共享前缀数据集的重放脚本
-- **完成标准**：同前缀重放场景 TTFT 显著下降并出数据；COW 触发时输出仍逐 token 一致（正确性红线）
+- **完成标准（2026-09-30 修订）**：
+  - 同前缀重放场景 TTFT 显著下降并出数据（实测 1.5B/bf16：暖请求 TTFT 恒定 ~42ms，关缓存随前缀线性增长，4096 前缀加速 9.0×）
+  - **开/关前缀缓存输出逐 token 一致**（同设备、同 dtype、同 attention 后端；J2 同路径判据）——以此**替代**原「COW 触发时输出仍逐 token 一致」
+  - COW 分支在纯 Transformer 下**不可触发**（vLLM 亦如此：`enable_partial_hash_hits` 要求 Mamba align group），其正确性改由**单测**覆盖；端到端红线待 fine-grained hash 落地后再验收
+  - 修订理由与源码证据见 `docs/notes/prefix-cache-partial-hits.md`
 - **Benchmark**：共享前缀命中率 vs TTFT 关系曲线；多轮对话 trace 重放的吞吐对比
 
 ### P7 · Decode CUDA Graph（性能里程碑）
