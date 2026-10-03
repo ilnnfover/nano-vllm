@@ -120,6 +120,9 @@ class EngineCore:
         scheduler_output = self.scheduler.schedule()
         sampled = self._execute(scheduler_output)
         finished = self.scheduler.update_from_output(scheduler_output, sampled)
+        graph_stats = (
+            self.runner.graph_runner.stats if self.runner.graph_runner is not None else None
+        )
         self.stats.update(
             num_batched_tokens=scheduler_output.num_batched_tokens,
             num_running=self.scheduler.num_running,
@@ -135,11 +138,21 @@ class EngineCore:
             prefix_cache_query_tokens=self.scheduler.prefix_query_tokens,
             prefix_cache_hit_tokens=self.scheduler.prefix_hit_tokens,
             prefix_cache_hit_blocks=self.scheduler.prefix_hit_blocks,
+            cudagraph_replays=graph_stats.replays if graph_stats else 0,
+            cudagraph_fallback_eager=graph_stats.fallback_eager if graph_stats else 0,
+            cudagraph_padded_seqs=graph_stats.padded_seqs if graph_stats else 0,
+            cudagraph_capture_ms=graph_stats.capture_ms if graph_stats else 0.0,
+            cudagraph_buckets=graph_stats.captured_buckets if graph_stats else 0,
         )
         return finished, sampled
 
     def _execute(self, scheduler_output: SchedulerOutput) -> dict[int, int]:
         """执行模型前向，返回 {seq_id: sampled_token_id}。
+
+        P7 分派（vLLM `FULL_DECODE_ONLY` 简化版）:
+          - decode 批且 n ≤ 最大桶 → **图回放**（uniform decode，全命中）
+          - 否则（超桶 / 未启用图 / prefill）→ **eager 回退**（NONE 模式）
+        prefill 批永远走 eager（P7 范围只捕获 decode）。
 
         采样判据统一为 `ScheduledSeq.samples_this_step`（chunk 终点到达已知 token 流
         末尾才采样）——前向对**全部**被调度的请求执行（KV 必须写），只是不一定采样：
@@ -162,14 +175,9 @@ class EngineCore:
                         seq = s.seq
                         sampled[seq.seq_id] = self._sample(seq, logits_map[seq.seq_id])
 
-        if len(decode_seqs) == 1:
-            s = decode_seqs[0]
-            logits = self._run_decode(s.seq)
-            if s.samples_this_step:
-                sampled[s.seq.seq_id] = self._sample(s.seq, logits)
-        elif len(decode_seqs) > 1:
+        if decode_seqs:
             seqs = [s.seq for s in decode_seqs]
-            logits_list = self._run_decode_batched(seqs)
+            logits_list = self._decode_logits(seqs)  # 全部前向：KV 必须写
             # 仅对"到达流末尾"的请求采样（budget=1 时追赶段可能只走 1 token 且未到末尾）
             idx = [i for i, s in enumerate(decode_seqs) if s.samples_this_step]
             sample_seqs = [seqs[i] for i in idx]
@@ -186,6 +194,30 @@ class EngineCore:
                     sampled[seq.seq_id] = self._sample(seq, logits)
 
         return sampled
+
+    @torch.no_grad()
+    def _decode_logits(self, seqs: list[Sequence]) -> list[torch.Tensor]:
+        """decode 批的逐请求 logits：优先图回放，否则回退 eager。
+
+        P1: 图只输出 `hidden_states`，logits 在**图外**用 `compute_logits` 算
+        （对齐 vLLM `hidden_states[logits_indices]` → `compute_logits`，
+        gpu_model_runner.py:4509-4510）。这样只算 n 行有效 token——
+        **padding 行不再白算 lm_head**（图内因静态形状躲不掉，见 qwen2.py:skip_lm_head）。
+        decode 批每行恰 1 个 token，故 vLLM 的 `hidden_states[logits_indices]`
+        在本实现里退化为 `hidden[:n]`（无 gather）。
+        """
+        graph = self.runner.graph_runner
+        if graph is not None and graph.can_use(len(seqs)):
+            hidden = graph.replay(seqs)                        # [n, hidden_size]
+            logits = self.runner.model.compute_logits(hidden)  # [n, vocab]，图外
+            if self.debug:
+                check_finite(logits, "cudagraph decode logits")
+            return [logits[i] for i in range(len(seqs))]
+        if graph is not None:
+            graph.note_fallback()
+        if len(seqs) == 1:
+            return [self._run_decode(seqs[0])]
+        return self._run_decode_batched(seqs)
 
     def _sample(self, seq: Sequence, logits: torch.Tensor) -> int:
         return self.runner.sampler.sample(

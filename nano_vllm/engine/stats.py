@@ -8,6 +8,7 @@ P6: prefix_cache_* 字段由 Scheduler 的累计命中统计填充（命中率�
 from __future__ import annotations
 
 from dataclasses import dataclass, asdict
+from typing import Any
 
 
 @dataclass
@@ -35,6 +36,19 @@ class EngineCoreStats:
     prefix_cache_hit_tokens: int = 0      # 累计命中 token
     prefix_cache_hit_blocks: int = 0      # 累计命中块数
 
+    # ---- P7 decode CUDA Graph（累计，由 DecodeGraphRunner 填充）----
+    cudagraph_replays: int = 0            # 图回放次数（命中）
+    cudagraph_fallback_eager: int = 0     # 回退 eager 次数（超桶 / 未启用图）
+    cudagraph_padded_seqs: int = 0        # 累计 padding 行数（桶对齐浪费）
+    cudagraph_capture_ms: float = 0.0     # 捕获总耗时（含 warmup）
+    cudagraph_buckets: int = 0            # 已捕获桶数
+
+    @property
+    def cudagraph_hit_rate(self) -> float:
+        """图命中率 = 回放 / (回放 + 回退)。"""
+        total = self.cudagraph_replays + self.cudagraph_fallback_eager
+        return self.cudagraph_replays / total if total else 0.0
+
     def update(
         self,
         num_batched_tokens: int,
@@ -51,6 +65,11 @@ class EngineCoreStats:
         prefix_cache_query_tokens: int = 0,
         prefix_cache_hit_tokens: int = 0,
         prefix_cache_hit_blocks: int = 0,
+        cudagraph_replays: int = 0,
+        cudagraph_fallback_eager: int = 0,
+        cudagraph_padded_seqs: int = 0,
+        cudagraph_capture_ms: float = 0.0,
+        cudagraph_buckets: int = 0,
     ) -> None:
         """每步更新：快照字段覆盖，累计字段累加。"""
         self.num_batched_tokens = num_batched_tokens
@@ -68,6 +87,11 @@ class EngineCoreStats:
         self.prefix_cache_query_tokens = prefix_cache_query_tokens
         self.prefix_cache_hit_tokens = prefix_cache_hit_tokens
         self.prefix_cache_hit_blocks = prefix_cache_hit_blocks
+        self.cudagraph_replays = cudagraph_replays
+        self.cudagraph_fallback_eager = cudagraph_fallback_eager
+        self.cudagraph_padded_seqs = cudagraph_padded_seqs
+        self.cudagraph_capture_ms = cudagraph_capture_ms
+        self.cudagraph_buckets = cudagraph_buckets
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> dict[str, Any]:
         return asdict(self)

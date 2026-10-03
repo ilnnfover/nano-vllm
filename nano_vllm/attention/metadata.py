@@ -25,6 +25,12 @@ class AttentionMetadata:
     # P4 批量 decode: 多条序列各自的 block_table 和 seq_len
     block_tables: list[list[int]] | None = None
     seq_lens: list[int] | None = None
+    # P7 图捕获 decode: 张量版寻址（来自预分配静态 buffer，地址固定 → 可被图捕获）
+    #   block_table_tensor: [bucket, max_blocks] int32
+    #   seq_lens_tensor:    [bucket] int32
+    # 非 None 时模型走 `paged_attention_triton_batch_tensor` 路径（含 bucket=1）。
+    block_table_tensor: torch.Tensor | None = None
+    seq_lens_tensor: torch.Tensor | None = None
     # P4 varlen prefill 拼批: flat 拼接多条请求的 prefill chunk
     # qo_indptr: [batch+1] query 累计长度；paged_kv_indptr: [batch+1] KV block 累计数
     # paged_kv_indices: 所有请求物理 block 拼接；paged_kv_last_page_len: [batch] 末块有效长度

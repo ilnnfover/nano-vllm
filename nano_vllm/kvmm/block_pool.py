@@ -47,6 +47,8 @@ class BlockPool:
             raise ValueError(f"num_blocks 必须为正, got: {num_blocks}")
         self.num_blocks = num_blocks
         self.blocks = [KVCacheBlock(i) for i in range(num_blocks)]
+        # P7: 永久预留块（图捕获的 padding 落点）——不进 free 队列，跨 reset 保持
+        self._reserved: set[int] = set()
         # 只装 ref_cnt==0 的块；头部 LRU（优先淘汰/分配），尾部最近使用
         self._free_queue: OrderedDict[int, None] = OrderedDict(
             (i, None) for i in range(num_blocks)
@@ -112,13 +114,34 @@ class BlockPool:
         blk.ref_cnt += 1
         self._free_queue.pop(block_id, None)
 
+    def reserve(self) -> int:
+        """P7 · 永久预留一个块并返回其 id（永不进入 free 队列，跨 reset 保持）。
+
+        用途: CUDA Graph 的 padding 行需要一个**确定且永不冲突**的写入落点。
+        padding 行的 K/V 会真实写入（reshape_and_cache 不看 seq_len），若指向
+        普通块会污染其他请求的 KV；若指向"当前临时分配"的块，则跨 reset 不稳定
+        （捕获时烧进图里的 block id 会失效）。故永久预留 1 块，代价是可用块 -1。
+        """
+        for i in range(self.num_blocks):
+            if i not in self._reserved:
+                self._reserved.add(i)
+                self._free_queue.pop(i, None)
+                blk = self.blocks[i]
+                blk.ref_cnt = 1
+                blk.block_hash = None
+                blk.block_hash_num_tokens = None
+                return i
+        raise ValueError("无空闲块可预留（块池已全部被预留/占用）")
+
     def reset(self) -> None:
-        """全部回收 + 清空前缀缓存索引（跨请求复用池时调用）。"""
-        self._free_queue = OrderedDict((i, None) for i in range(self.num_blocks))
+        """全部回收 + 清空前缀缓存索引（跨请求复用池时调用）。预留块保持不变。"""
+        self._free_queue = OrderedDict(
+            (i, None) for i in range(self.num_blocks) if i not in self._reserved
+        )
         self._hash_index.clear()
         self._block_hashes.clear()
         for blk in self.blocks:
-            blk.ref_cnt = 0
+            blk.ref_cnt = 1 if blk.block_id in self._reserved else 0
             blk.block_hash = None
             blk.block_hash_num_tokens = None
 

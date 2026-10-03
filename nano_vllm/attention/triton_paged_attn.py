@@ -186,37 +186,30 @@ def _paged_attn_decode_batch_kernel(
     tl.store(out_ptr + q_base + offs_d, out, mask=d_mask)
 
 
-def paged_attention_triton_batch(
+def _launch_paged_attn_batch(
     q: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
-    block_tables: list[list[int]],
-    seq_lens: list[int],
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
     num_kv_heads: int,
     scaling: float,
 ) -> torch.Tensor:
-    """A3 · Triton 批量 paged attention（decode 多条一次算完）。
+    """批量 paged attention 的实际 launch 口：入参全部为张量（图友好）。
 
     Args:
         q: [b, num_heads, 1, head_dim]
         k_cache/v_cache: [num_blocks, block_size, num_kv_heads, head_dim]
-        block_tables: list[list[int]]，每请求的 block_table
-        seq_lens: list[int]，每请求的实际 KV 长度
-    Returns:
-        [b, num_heads, 1, head_dim]
+        block_table: [b, max_blocks] int32（静态 buffer 可直接传入）
+        seq_lens: [b] int32
     """
     b, num_heads, _, head_dim = q.shape
     if not q.is_cuda and not _INTERPRET:
         raise RuntimeError("Triton kernel 需要 CUDA 设备（或设 TRITON_INTERPRET=1 走 CPU 解释器）")
 
     block_size = k_cache.shape[1]
+    max_blocks = block_table.shape[1]
     num_queries_per_kv = num_heads // num_kv_heads
-    max_blocks = max(len(bt) for bt in block_tables)
-
-    bt_2d = torch.zeros(b, max_blocks, dtype=torch.int32, device=q.device)
-    for i, bt in enumerate(block_tables):
-        bt_2d[i, : len(bt)] = torch.tensor(bt, dtype=torch.int32, device=q.device)
-    seq_lens_t = torch.tensor(seq_lens, dtype=torch.int32, device=q.device)
 
     q_flat = q.reshape(b, num_heads, head_dim).contiguous()
     out = torch.empty_like(q_flat)
@@ -228,8 +221,8 @@ def paged_attention_triton_batch(
         q_flat,
         k_cache,
         v_cache,
-        bt_2d,
-        seq_lens_t,
+        block_table,
+        seq_lens,
         out,
         num_kv_heads,
         head_dim,
@@ -241,3 +234,55 @@ def paged_attention_triton_batch(
         BLOCK_N=BLOCK_N,
     )
     return out.reshape(b, num_heads, 1, head_dim)
+
+
+def paged_attention_triton_batch(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    block_tables: list[list[int]],
+    seq_lens: list[int],
+    num_kv_heads: int,
+    scaling: float,
+) -> torch.Tensor:
+    """A3 · Triton 批量 paged attention（decode 多条一次算完，list 入参版）。
+
+    Args:
+        q: [b, num_heads, 1, head_dim]
+        k_cache/v_cache: [num_blocks, block_size, num_kv_heads, head_dim]
+        block_tables: list[list[int]]，每请求的 block_table
+        seq_lens: list[int]，每请求的实际 KV 长度
+    Returns:
+        [b, num_heads, 1, head_dim]
+    """
+    b = q.shape[0]
+    max_blocks = max(len(bt) for bt in block_tables)
+
+    bt_2d = torch.zeros(b, max_blocks, dtype=torch.int32, device=q.device)
+    for i, bt in enumerate(block_tables):
+        bt_2d[i, : len(bt)] = torch.tensor(bt, dtype=torch.int32, device=q.device)
+    seq_lens_t = torch.tensor(seq_lens, dtype=torch.int32, device=q.device)
+
+    return _launch_paged_attn_batch(
+        q, k_cache, v_cache, bt_2d, seq_lens_t, num_kv_heads, scaling
+    )
+
+
+def paged_attention_triton_batch_tensor(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    num_kv_heads: int,
+    scaling: float,
+) -> torch.Tensor:
+    """P7 · 张量入参版批量 paged attention（CUDA Graph 用）。
+
+    与 `paged_attention_triton_batch` 语义完全一致，区别只在入参形式：
+    block_table/seq_lens 直接来自**预分配的静态 buffer**（地址固定），
+    因此整个调用可被图捕获；list 版每步都要 host 侧新建 2D 张量（不可捕获）。
+    """
+    return _launch_paged_attn_batch(
+        q, k_cache, v_cache, block_table, seq_lens, num_kv_heads, scaling
+    )

@@ -1,0 +1,65 @@
+{
+  "model": "models/Qwen2.5-1.5B-Instruct",
+  "dtype": "bf16",
+  "gpu": "NVIDIA GeForce RTX 4070 Ti SUPER",
+  "torch": "2.14.0+cu130",
+  "batch": 8,
+  "prompt_len": 128,
+  "steps": 30,
+  "attn_impl": "triton",
+  "eager": {
+    "steps": 30,
+    "unprofiled_tpot_p50_ms": 37.79280300295795,
+    "gpu_busy_us": 506239.7039999616,
+    "gpu_busy_per_step_us": 16874.65679999872,
+    "cpu_api_total_per_step_us": 16113.203099998998,
+    "graph_launch_us_per_step": 0.0,
+    "kernel_launch_us_per_step": 6971.477333332719,
+    "memcpy_us_per_step": 4022.192066666946,
+    "sync_us_per_step": 4942.4066999997385,
+    "other_api_us_per_step": 177.12699999959563,
+    "top_api_keys_us": {
+      "cudaLaunchKernel": 198963.2,
+      "cudaStreamSynchronize": 148267.9,
+      "cudaMemcpyAsync": 120074.7,
+      "cudaLaunchKernelExC": 10181.1,
+      "cudaStreamIsCapturing": 3024.3,
+      "cudaDeviceGetAttribute": 2289.5
+    },
+    "launch_over_gpu_busy": 0.41313298492288436,
+    "kernel_launch_per_step_us": 6971.477333332719,
+    "launch_share_of_tpot": 0.184465738960592,
+    "cpu_api_total_share_of_tpot": 0.4263563911556879
+  },
+  "cudagraph": {
+    "steps": 30,
+    "unprofiled_tpot_p50_ms": 7.890680000855355,
+    "gpu_busy_us": 223230.8000000001,
+    "gpu_busy_per_step_us": 7441.02666666667,
+    "cpu_api_total_per_step_us": 7817.494833333339,
+    "graph_launch_us_per_step": 1135.2288,
+    "kernel_launch_us_per_step": 76.03363333333382,
+    "memcpy_us_per_step": 6455.7071,
+    "sync_us_per_step": 146.010733333332,
+    "other_api_us_per_step": 4.514566666672423,
+    "top_api_keys_us": {
+      "cudaMemcpyAsync": 193152.6,
+      "cudaGraphLaunch": 34056.9,
+      "cudaStreamSynchronize": 4339.2,
+      "cudaLaunchKernel": 2281.0,
+      "cudaMemsetAsync": 518.6,
+      "cudaStreamIsCapturing": 135.4
+    },
+    "launch_over_gpu_busy": 0.16278162780404853,
+    "kernel_launch_per_step_us": 76.03363333333382,
+    "launch_share_of_tpot": 0.009635878444581674,
+    "cpu_api_total_share_of_tpot": 0.9907251127261424,
+    "capture_ms": 483.7955729999521
+  },
+  "reduction": {
+    "kernel_launch_per_step_before_us": 6971.477333332719,
+    "kernel_launch_per_step_after_us": 76.03363333333382,
+    "launch_share_of_tpot_before": 0.184465738960592,
+    "launch_share_of_tpot_after": 0.009635878444581674
+  }
+}

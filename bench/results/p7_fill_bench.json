@@ -1,0 +1,87 @@
+{
+  "gpu": "NVIDIA GeForce RTX 4070 Ti SUPER",
+  "torch": "2.14.0+cu130",
+  "block_size": 16,
+  "iters": 2000,
+  "rounds": 5,
+  "cases": {
+    "bucket8_n8": {
+      "bucket": 8,
+      "n": 8,
+      "buffers_identical": true,
+      "legacy_us_per_fill": 254.09,
+      "single_us_per_fill": 214.45,
+      "speedup": 1.185,
+      "saved_us_per_fill": 39.64,
+      "legacy_min_us": 227.96,
+      "single_min_us": 211.12,
+      "speedup_min": 1.08,
+      "legacy_rounds_us": [
+        254.09,
+        241.95,
+        259.08,
+        227.96,
+        258.04
+      ],
+      "single_rounds_us": [
+        215.74,
+        214.45,
+        218.13,
+        211.12,
+        213.79
+      ]
+    },
+    "bucket8_n5": {
+      "bucket": 8,
+      "n": 5,
+      "buffers_identical": true,
+      "legacy_us_per_fill": 301.43,
+      "single_us_per_fill": 216.73,
+      "speedup": 1.391,
+      "saved_us_per_fill": 84.7,
+      "legacy_min_us": 294.12,
+      "single_min_us": 195.73,
+      "speedup_min": 1.503,
+      "legacy_rounds_us": [
+        294.12,
+        294.67,
+        301.43,
+        337.42,
+        369.3
+      ],
+      "single_rounds_us": [
+        204.75,
+        195.73,
+        216.73,
+        228.61,
+        226.93
+      ]
+    },
+    "bucket32_n17": {
+      "bucket": 32,
+      "n": 17,
+      "buffers_identical": true,
+      "legacy_us_per_fill": 347.47,
+      "single_us_per_fill": 272.06,
+      "speedup": 1.277,
+      "saved_us_per_fill": 75.4,
+      "legacy_min_us": 337.5,
+      "single_min_us": 239.77,
+      "speedup_min": 1.408,
+      "legacy_rounds_us": [
+        347.47,
+        337.5,
+        391.63,
+        368.61,
+        341.98
+      ],
+      "single_rounds_us": [
+        239.77,
+        272.06,
+        279.06,
+        275.27,
+        256.79
+      ]
+    }
+  }
+}

@@ -38,6 +38,8 @@ class NanoRunner:
         num_blocks: int | None = None,
         attn_impl: str = "torch",
         prefill_impl: str = "torch",
+        enable_cudagraph: bool | None = None,
+        cudagraph_buckets: tuple[int, ...] | None = None,
     ) -> None:
         self.model_path = model_path
         self.device = device
@@ -45,6 +47,12 @@ class NanoRunner:
         self.block_size = block_size
         self.attn_impl = attn_impl
         self.prefill_impl = prefill_impl
+        self.enable_cudagraph = (
+            (device == "cuda" and torch.cuda.is_available() and attn_impl == "triton")
+            if enable_cudagraph is None
+            else enable_cudagraph
+        )
+        self.cudagraph_buckets = cudagraph_buckets
         self.config = Qwen2Config.from_json(Path(model_path) / "config.json")
         self.model = Qwen2ForCausalLM(self.config).to(device=device, dtype=dtype).eval()
         self.model.load_weights(model_path)
@@ -75,6 +83,20 @@ class NanoRunner:
         self._block_table: list[int] | None = None
         self._paged_seq_len = 0
         self.pad_id = 0
+        # P7 · decode CUDA Graph（懒捕获：首次回放时才 capture，见 DecodeGraphRunner）
+        self.graph_runner = None
+        if self.enable_cudagraph:
+            from nano_vllm.cudagraph import DEFAULT_BUCKETS, DecodeGraphRunner
+
+            self.graph_runner = DecodeGraphRunner(
+                self.model,
+                self.paged_cache,
+                self.config,
+                buckets=cudagraph_buckets or DEFAULT_BUCKETS,
+                attn_impl=attn_impl,
+                device=device,
+                dtype=dtype,
+            )
 
     def _profile_num_blocks(self, block_size: int, dtype: torch.dtype, device: str) -> int:
         """按剩余显存反推 num_blocks（B1）。CPU 回退到单条够用的默认值。"""

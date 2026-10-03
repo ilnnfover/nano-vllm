@@ -12,7 +12,10 @@ import torch.nn.functional as F
 
 from nano_vllm.attention.backend import get_paged_attn
 from nano_vllm.attention.metadata import AttentionMetadata
-from nano_vllm.attention.triton_paged_attn import paged_attention_triton_batch
+from nano_vllm.attention.triton_paged_attn import (
+    paged_attention_triton_batch,
+    paged_attention_triton_batch_tensor,
+)
 from nano_vllm.attention.varlen_prefill import varlen_prefill_attention
 from nano_vllm.config import Qwen2Config
 
@@ -50,6 +53,10 @@ class RotaryEmbedding(nn.Module):
         super().__init__()
         inv_freq = 1.0 / (rope_theta ** (torch.arange(0, head_dim, 2, dtype=torch.float) / head_dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
+        # 显式注解赋值：静态检查器看不见 register_buffer 建立的动态属性（否则 inv_freq 被当成
+        # Module）。该名字已在 `_buffers` 中，故 `Module.__setattr__` 仍写回缓冲区 →
+        # 设备迁移 / state_dict 行为不变（persistent=False 本就不进 state_dict）。
+        self.inv_freq: torch.Tensor = inv_freq
 
     @torch.no_grad()
     def forward(self, x: torch.Tensor, position_ids: torch.Tensor):
@@ -127,13 +134,27 @@ class Attention(nn.Module):
             raise ValueError("分页路径必须传 AttentionMetadata")
         if metadata.is_prefill and b > 1:
             raise ValueError(f"分页 prefill 暂只支持 b=1, got b={b}")
-        if not metadata.is_prefill and b > 1 and metadata.block_tables is None:
-            raise ValueError("批量 decode 必须传 block_tables")
+        if (
+            not metadata.is_prefill
+            and b > 1
+            and metadata.block_tables is None
+            and metadata.block_table_tensor is None
+        ):
+            # P7: 批量 decode 可用 list 寻址（block_tables）或张量寻址（block_table_tensor）
+            raise ValueError("批量 decode 必须传 block_tables 或 block_table_tensor")
         paged_cache.write(layer_idx, k[0] if b == 1 else k.squeeze(2).transpose(0, 1),
                           v[0] if b == 1 else v.squeeze(2).transpose(0, 1),
                           metadata.slot_mapping)
         if metadata.is_prefill:
             if metadata.qo_indptr is not None:
+                if (
+                    metadata.paged_kv_indptr is None
+                    or metadata.paged_kv_indices is None
+                    or metadata.paged_kv_last_page_len is None
+                ):
+                    raise ValueError(
+                        "varlen prefill 必须同时提供 qo_indptr 与三个 paged_kv_* 元数据"
+                    )
                 # P4 varlen 拼批 prefill: flat 拼接多条请求，一次算完
                 q_flat = q[0].transpose(0, 1).contiguous()  # [total_q, num_heads, head_dim]
                 out_flat = varlen_prefill_attention(
@@ -163,8 +184,25 @@ class Attention(nn.Module):
             else:
                 out = self._sdpa(q, k, v, attn_mask=None, is_causal=True)
         else:
+            # P7: 张量寻址路径（图捕获）——block_table/seq_lens 来自静态 buffer
+            if metadata.block_table_tensor is not None:
+                if metadata.seq_lens_tensor is None:
+                    raise ValueError("张量寻址路径必须同时提供 seq_lens_tensor")
+                return self.o_proj(
+                    paged_attention_triton_batch_tensor(
+                        q,
+                        paged_cache.k_cache[layer_idx],
+                        paged_cache.v_cache[layer_idx],
+                        metadata.block_table_tensor,
+                        metadata.seq_lens_tensor,
+                        self.num_kv_heads,
+                        self.scaling,
+                    ).transpose(1, 2).reshape(b, s, -1)
+                )
             attn_fn = get_paged_attn(metadata.attn_impl)
             if b == 1:
+                if metadata.block_table is None:
+                    raise ValueError("单条 decode 必须传 block_table")
                 out = attn_fn(
                     q[0],
                     paged_cache.k_cache[layer_idx],
@@ -175,13 +213,16 @@ class Attention(nn.Module):
                     self.scaling,
                 ).unsqueeze(0)
             else:
+                block_tables, seq_lens = metadata.block_tables, metadata.seq_lens
+                if block_tables is None or seq_lens is None:
+                    raise ValueError("批量 decode 必须传 block_tables 与 seq_lens")
                 if metadata.attn_impl == "triton":
                     out = paged_attention_triton_batch(
                         q,
                         paged_cache.k_cache[layer_idx],
                         paged_cache.v_cache[layer_idx],
-                        metadata.block_tables,
-                        metadata.seq_lens,
+                        block_tables,
+                        seq_lens,
                         self.num_kv_heads,
                         self.scaling,
                     )
@@ -192,8 +233,8 @@ class Attention(nn.Module):
                             q[i],
                             paged_cache.k_cache[layer_idx],
                             paged_cache.v_cache[layer_idx],
-                            metadata.block_tables[i],
-                            metadata.seq_lens[i],
+                            block_tables[i],
+                            seq_lens[i],
                             self.num_kv_heads,
                             self.scaling,
                         ))
@@ -327,7 +368,9 @@ class Qwen2Model(nn.Module):
         hidden_states = self.embed_tokens(input_ids)
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
-        all_hidden = [hidden_states] if output_hidden_states else None
+        all_hidden: list[torch.Tensor] | None = (
+            [hidden_states] if output_hidden_states else None
+        )
         for layer_idx, layer in enumerate(self.layers):
             hidden_states = layer(
                 hidden_states, position_embeddings,
@@ -335,11 +378,11 @@ class Qwen2Model(nn.Module):
                 is_prefill=is_prefill, cache_seq_len=cache_seq_len,
                 attn_mask=attn_mask, paged_cache=paged_cache, metadata=metadata,
             )
-            if output_hidden_states:
+            if all_hidden is not None:
                 all_hidden.append(hidden_states)
 
         hidden_states = self.norm(hidden_states)
-        if output_hidden_states:
+        if all_hidden is not None:
             all_hidden[-1] = hidden_states
         return hidden_states, all_hidden
 
@@ -365,6 +408,7 @@ class Qwen2ForCausalLM(nn.Module):
         last_idx: torch.Tensor | None = None,
         paged_cache=None,
         metadata: AttentionMetadata | None = None,
+        skip_lm_head: bool = False,
     ):
         hidden_states, all_hidden = self.model(
             input_ids, output_hidden_states,
@@ -373,6 +417,12 @@ class Qwen2ForCausalLM(nn.Module):
             position_ids=position_ids,
             paged_cache=paged_cache, metadata=metadata,
         )
+        if skip_lm_head:
+            # P1 · 图捕获路径：图只到 final norm 后的 hidden_states，logits 在图外算
+            # （见 `compute_logits`）。理由：**静态形状下图内躲不掉整桶计算**——
+            # 即便传 last_idx 也必须是固定索引，而 padding 行就落在 [0, bucket) 里，
+            # 照样白算 lm_head。移出图后只算有效行 n。
+            return hidden_states, all_hidden
         if last_idx is not None:
             b = hidden_states.shape[0]
             selected = hidden_states[torch.arange(b, device=hidden_states.device), last_idx]
@@ -380,6 +430,17 @@ class Qwen2ForCausalLM(nn.Module):
         else:
             logits = self.lm_head(hidden_states)
         return logits, all_hidden
+
+    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """P1 · 图外 logits 投影：`[n, hidden_size]` → `[n, vocab_size]`。
+
+        对齐 vLLM `self.model.compute_logits(sample_hidden_states)`
+        （`gpu_model_runner.py:4509-4510`，其前置是 `hidden_states[logits_indices]`）。
+
+        与图内版本数值同源（同一个 `lm_head`），区别只在**行数**：图内受静态形状
+        限制必须按整桶算，这里只算有效行。
+        """
+        return self.lm_head(hidden_states)
 
     @torch.no_grad()
     def load_weights(self, model_dir: str) -> None:

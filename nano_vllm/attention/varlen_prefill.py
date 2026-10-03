@@ -53,7 +53,7 @@ def build_paged_kv_metadata(
     block_tables: list[list[int]],
     kv_lens: list[int],
     block_size: int,
-    device: torch.device,
+    device: str | torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """从 block_table 列表构造 flashinfer 分页元数据。
 

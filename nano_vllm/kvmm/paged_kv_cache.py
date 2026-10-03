@@ -72,6 +72,7 @@ class PagedKVCache:
         self.v_cache = torch.zeros(shape, dtype=dtype, device=self.device)
 
         self._written_tokens = 0
+        self._scratch_block: int | None = None
 
     @staticmethod
     def blocks_needed(seq_len: int, block_size: int) -> int:
@@ -136,6 +137,34 @@ class PagedKVCache:
     def reset(self) -> None:
         self.pool.reset()
         self._written_tokens = 0
+
+    # ---------------- P7: 图捕获用的预留块与写入计数 ----------------
+
+    def reserve_scratch_block(self) -> int:
+        """预留 padding 行的落点块（图捕获用；跨 reset 稳定，见 BlockPool.reserve）。"""
+        self._scratch_block = self.pool.reserve()
+        return self._scratch_block
+
+    @property
+    def scratch_block(self) -> int | None:
+        return self._scratch_block
+
+    def note_written(self, num_tokens: int) -> None:
+        """补记一次前向写入的 token 数。
+
+        图回放路径下 `write()` 内部的 host 计数不会执行（它在图内），
+        故由调用方（EngineCore / 图管理器）在回放后补记。
+        """
+        self._written_tokens += num_tokens
+
+    @property
+    def written_tokens(self) -> int:
+        return self._written_tokens
+
+    @written_tokens.setter
+    def written_tokens(self, value: int) -> None:
+        """快照/恢复写入计数：图捕获与热身是 dummy 写入，不应计入真实统计。"""
+        self._written_tokens = value
 
     @property
     def num_used_blocks(self) -> int:
