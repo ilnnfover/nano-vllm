@@ -1,0 +1,23 @@
+{
+  "meta": {
+    "time": "2026-10-03 19:25:53",
+    "git": "1aae220",
+    "torch": "2.14.0+cu130",
+    "gpu": "NVIDIA GeForce RTX 4070 Ti SUPER",
+    "tolerance": 0.3
+  },
+  "correctness": {
+    "passed": true,
+    "returncode": 0,
+    "summary": "130 passed in 138.22s (0:02:18)",
+    "seconds": 140.9
+  },
+  "perf": {
+    "batch": 8,
+    "prompt_len": 64,
+    "steps": 30,
+    "eager_ms": 34.942,
+    "graph_ms": 8.128,
+    "graph_speedup": 4.299
+  }
+}

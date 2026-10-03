@@ -17,8 +17,11 @@
   - `wall_ms` / `outputs_identical`（两种口径的 greedy 输出必须逐 token 一致）
 
 用法:
-  python bench/p8_preempt_bench.py --model models/Qwen2.5-1.5B-Instruct
-输出: bench/results/p8_preempt_align.json
+  python bench/preempt_align_bench.py --model models/Qwen2.5-1.5B-Instruct
+输出: bench/results/preempt_align.json
+
+注：本脚本原文件名带 `p8_` 前缀，与 roadmap 里 P8（算子融合 + 权重预拼接）撞号。
+抢占恢复对齐是「P7 前置整改」，不是阶段，故改名去掉前缀（见 docs/notes/p8-prereq.md）。
 """
 from __future__ import annotations
 
@@ -176,7 +179,7 @@ def main() -> None:
     ap.add_argument("--num-requests", type=int, default=6)
     ap.add_argument("--max-new-tokens", type=int, default=32)
     ap.add_argument("--repeat", type=int, default=3)
-    ap.add_argument("--tag", default="p8_preempt_align")
+    ap.add_argument("--tag", default="preempt_align")
     args = ap.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"

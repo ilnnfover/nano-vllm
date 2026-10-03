@@ -229,10 +229,15 @@ class DecodeGraphRunner:
         if bucket is None:
             raise ValueError(f"请求数 {n} 超过最大桶 {self.max_bucket}")
         self.buffers.fill(seqs, self.paged_cache, self.scratch_block, bucket)
+        # eager 前向会**真实执行** `PagedKVCache.write()` → 已按 bucket 计过写入数（且含 padding 行）。
+        # 故先快照、后恢复，再只按真实行 n 补记；否则会与下面的 note_written(n) 双计，
+        # 使 `waste_rate` 失真（P7.md 补记「顺带发现」记录的即此）。
+        written_before = self.paged_cache.written_tokens
         # 新张量，不覆盖 self.outputs[bucket]（图输出仍留在池内）
         hidden = self._forward(bucket)
         self.stats.replays += 1
         self.stats.padded_seqs += bucket - n
+        self.paged_cache.written_tokens = written_before
         self.paged_cache.note_written(n)
         return hidden[:n]
 

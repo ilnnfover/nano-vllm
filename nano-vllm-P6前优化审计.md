@@ -498,6 +498,13 @@ P5 chat triton 不达标：chat prompt 在 triton online softmax（float32 累�
 - **第 3 批**（A6 调度节流 / TPOT p99 测量）：尾延迟。
 - **A7/A8/B4/C4/C5**：明确推到 P6 之后或 P7 本体。
 
+> **后续修订（2026-10-03）**：P2-03 记的三个工具缺口，现状如下，细节见 `docs/notes/p8-prereq.md`。
+> - `bench/regress.py` + `baseline.json` —— **已补**。两档：正确性（pytest 退出码，硬门）+ 性能
+>   （同进程 eager/graph **比值**门；绝对值只 WARN，因本机跨 run 漂移实测可达 21%）。
+> - `bench/profile.py` —— **仍未收成通用脚本**，职能由阶段临时脚本承担：`bench/p7_profiler.py`
+>   出整步 launch 占比，`bench/layer_kernels.py` 出单层 kernel 数（P8 验收用）。
+> - `bench/run_vllm.py` —— **仍缺**；横向对照目前靠 `bench/vllm_cudagraph_probe.py` 等单点探针。
+
 ### 维度 E · 代码结构与可维护性修复（2026-09-27）
 
 > E1–E8 全部修复，35/35 测试全绿（TRITON_INTERPRET=1 CPU 解释器模式）。

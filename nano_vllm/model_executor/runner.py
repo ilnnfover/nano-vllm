@@ -1,5 +1,6 @@
 """P3+ · 执行器：分页 KV cache（BlockPool + block_table + slot_mapping），
-decode attention 可选 torch 朴素 / 自研 Triton kernel（attn_impl）。
+decode attention 可选 torch 朴素 / sdpa / 自研 Triton kernel（attn_impl，见 attention/backend.py）。
+其中 CUDA Graph（P7）只支持 `triton`；缺省 `enable_cudagraph` 据此自动决定。
 
 P1 eager / P2 连续 cache / P2 静态批的历史入口已拆到 legacy_api.py（E5），
 本模块保留薄委托转发以维持向后兼容。

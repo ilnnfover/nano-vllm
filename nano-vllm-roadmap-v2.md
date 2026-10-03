@@ -142,10 +142,11 @@ golden/
 - **Benchmark**：P4 vs P7 的 TPOT 全曲线；桶数 3 档 vs 6 档的（显存, TPOT）tradeoff 实验；命中/回退率统计
 
 ### P8 · 融合算子与权重预拼接
-- **必须实现**：Triton 融合 residual+RMSNorm；RoPE 内联进 QKV 后处理；SwiGLU 融合；加载时按 config 预拼接 QKV（3 GEMM→1）与 gate/up（2→1）；attention 保留三实现（Triton 自研 / flash-attn / SDPA）做对照开关
+- **必须实现**：Triton 融合 residual+RMSNorm；RoPE 内联进 QKV 后处理；SwiGLU 融合；加载时按 config 预拼接 QKV（3 GEMM→1）与 gate/up（2→1）
+- **attention 对照开关（2026-10-03 修订）**：decode 侧三实现由 `attn_impl` 切换 —— `torch`（einsum 朴素 oracle）/ `sdpa`（`F.scaled_dot_product_attention`）/ `triton`（自研，P7 图路径唯一支持）。register 见 `nano_vllm/attention/backend.py`；**原定的第二实现 flash-attn 改为 SDPA**，理由见 `docs/notes/p8-prereq.md`（PyPI 只有 sdist、需源码编译、CUDA 13 + torch 2.14 组合未验证；SDPA 已能提供数值路径独立的第二条实现）
 - **参考源码**：`vllm/v1/worker/gpu_model_runner.py` 的 custom_ops 调用点、`vllm/_custom_ops.py`（只读）
-- **验证产出**：逐 token 与 P7 一致性脚本（拼接前后、融合前后各一）；torch profiler 单层 kernel 计数脚本
-- **完成标准**：输出逐 token 一致；单层 kernel launch 数下降 ≥30%（profiler 前后对比）；TPOT 再降 5–15%
+- **验证产出**：与 P7 的**数值等价**对照脚本（拼接前后、融合前后各一，判据见下）；单层 kernel 计数脚本 `bench/layer_kernels.py`（**已就绪**）
+- **完成标准（2026-10-03 修订）**：**J3 跨路径数值等价**——逐步 logits 的 `max abs diff ≤ ε`，且首个分歧处 top1/top2 的 margin < ε 可解释翻转（**不是**"逐 token 一致"：融合/预拼接改变数值路径，按 P2 已证的结论，跨路径逐 token 相同不可达，见 `nano-vllm-报告复核与P3前问题清单.md` P1-10）；同路径（融合开关关闭）下输出逐 token 一致；单层 kernel launch 数下降 ≥30%（`layer_kernels.py` 前后对比）；TPOT 再降 5–15%
 - **Benchmark**：单算子微基准（融合 vs 不融合，µs 级）；端到端 P7 vs P8 的 TPOT/吞吐；launch 数与 GPU busy 占比对比
 
 ### P9 · 可选扩展（按性价比排序，做前先看第 2 节裁剪清单）

@@ -1,7 +1,11 @@
 """P3 · attention 后端注册表：同一进程内切换 paged attention 实现。
 
 P0-07 的问题: attention 后端选择硬编码在模型里（q.is_cuda 决定 GQA 融合 vs repeat_kv）。
-P3 起用注册表 + 显式 attn_impl 开关，P8 的"三实现对照开关"由此扩展。
+P3 起用注册表 + 显式 attn_impl 开关。
+
+decode 侧三实现对照：`torch`（einsum 朴素 oracle） / `sdpa`（F.scaled_dot_product_attention）
+/ `triton`（自研 kernel，P7 CUDA Graph 唯一支持实现）。
+roadmap 原写的第二实现是 flash-attn，已改为 SDPA —— 理由见 `docs/notes/p8-prereq.md`。
 """
 from __future__ import annotations
 
@@ -9,7 +13,7 @@ from collections.abc import Callable
 
 import torch
 
-from nano_vllm.attention.paged_attn import paged_attention_torch
+from nano_vllm.attention.paged_attn import paged_attention_sdpa, paged_attention_torch
 from nano_vllm.attention.triton_paged_attn import paged_attention_triton
 from nano_vllm.attention.varlen_prefill import varlen_prefill_torch, varlen_prefill_flashinfer
 
@@ -19,8 +23,9 @@ PagedAttnFn = Callable[
 ]
 
 PAGED_ATTN_BACKENDS: dict[str, PagedAttnFn] = {
-    "torch": paged_attention_torch,
-    "triton": paged_attention_triton,
+    "torch": paged_attention_torch,   # einsum + softmax 朴素 oracle
+    "sdpa": paged_attention_sdpa,     # gather 成连续 KV 后走 F.scaled_dot_product_attention
+    "triton": paged_attention_triton,  # 自研 Triton kernel（P7 图路径唯一实现）
 }
 
 PrefillAttnFn = Callable[

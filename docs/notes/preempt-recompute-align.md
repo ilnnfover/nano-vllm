@@ -62,7 +62,7 @@ def _use_prefill_route(seq, num_new) -> bool:
 | **S1** | `Sequence` 新增 `all_token_ids` / `input_token_ids(start,k)`（位置式取法） | 纯新增，11 项单测；全量 126 绿 |
 | **S2** | 执行路径统一取 token：`_run_prefill*` / `_run_decode*` / `DecodeBuffers.fill` 全部改走 `input_token_ids` | 等价重构，全量 126 绿 |
 | **S3** | 行为变化：`reset_for_preemption` 保留 output；查找传全流 + 钳制 `num_tokens - 1`；调度器统一记账；采样判据统一；`ScheduledSeq.num_tokens` → `num_scheduled_tokens` | 新增 4 用例；全量 **130 绿** |
-| **S4** | 对照基准 `bench/p8_preempt_bench.py`（monkeypatch 复刻旧口径，单变量） | 落盘 `bench/results/p8_preempt_align.json` |
+| **S4** | 对照基准 `bench/preempt_align_bench.py`（monkeypatch 复刻旧口径，单变量） | 落盘 `bench/results/preempt_align.json` |
 
 `S3` 的关键改动点：
 
@@ -80,7 +80,7 @@ seq.num_computed_tokens + num_scheduled_tokens >= seq.num_tokens
 
 ## 3. 实测（Qwen2.5-1.5B-Instruct / bf16 / RTX 4070 Ti SUPER，不外推）
 
-`bench/results/p8_preempt_align.json`；负载：6 条 48-token prompt、max_new=32、
+`bench/results/preempt_align.json`；负载：6 条 48-token prompt、max_new=32、
 **紧池 20 块**（故意触发抢占）、3 次重复取中位数；两种口径同池同负载同种子。
 
 | 指标 | legacy（改动前） | aligned（改动后） | 变化 |
