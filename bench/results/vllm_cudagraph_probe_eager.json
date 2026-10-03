@@ -1,0 +1,30 @@
+{
+  "mode": "eager",
+  "vllm_version": "0.29.0",
+  "torch": "2.13.0+cu132",
+  "gpu": "NVIDIA GeForce RTX 4070 Ti SUPER",
+  "model": "models/Qwen2.5-1.5B-Instruct",
+  "max_model_len": 1024,
+  "gpu_memory_utilization": 0.45,
+  "n_captures": 0,
+  "n_distinct_pools": 0,
+  "pools": [],
+  "sum_d_alloc_MB": 0,
+  "sum_d_res_MB": 0,
+  "end_allocated_MB": 6615.6435546875,
+  "end_reserved_MB": 7218.0,
+  "peak_allocated_MB": 7137.21728515625,
+  "reserved_before_llm_MB": 0.0,
+  "mem_after_init": {
+    "allocated_MB": 6615.64306640625,
+    "reserved_MB": 7218.0,
+    "peak_allocated_MB": 7137.21728515625
+  },
+  "captures": [],
+  "sample_output_len": [
+    8,
+    8,
+    8,
+    8
+  ]
+}

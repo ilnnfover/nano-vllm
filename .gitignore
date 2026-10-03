@@ -6,6 +6,7 @@ vllm-src/
 
 # agent 工具目录
 .codeartsdoer/
+.arts/
 
 # Python
 __pycache__/
@@ -20,6 +21,10 @@ venv/
 *.bin
 *.pt
 *.pth
+# bench 图：只入库 JSON 数据（脚本 + JSON 足以复现），位图不入
+bench/results/*.png
+# profiler 原始 trace（24MB/8MB 量级，可由脚本重新生成）
+bench/results/*_trace.json
 
 # CUDA / Triton 编译缓存
 .cache/
