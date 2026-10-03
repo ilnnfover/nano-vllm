@@ -1,15 +1,21 @@
 """P4 · Scheduler：连续批处理调度器（iteration-level scheduling）。
 
-核心算法（Branch 2/3/5 锁定）:
-  1. 先调度 RUNNING 请求（decode 优先 — Branch 5）
-     - decode: 每请求 1 token
-     - in-progress prefill: chunk 受剩余 budget 限制
-     - block 不足时抢占自身（free → reset → 放回 waiting 队首）
-  2. 再调度 WAITING 请求（prefill chunk，用剩余 budget）
-     - block 不足时 LIFO 抢占 running 中最新请求（Branch 3）
-     - 无 running 可抢占则停止调度
-  3. token budget 统一记账（Branch 3）：Σ(prefill chunk) + Σ(decode 1) ≤ max_num_batched_tokens
+核心算法（Branch 2/3/5 锁定; R2/P8 修订见下）:
+  0. **统一记账（对齐 vLLM，P8）**：请求只有一条 token 流
+     `T = prompt + output`，没有 prefill/decode 阶段之分；
+     `num_new_tokens = num_tokens - num_computed_tokens` —— 稳态 decode 恒为 1，
+     抢占恢复后的追赶段为整段（受 budget / 节流阀截断）。
+     采样判据 = chunk 终点到达 T 末尾（`ScheduledSeq.samples_this_step`）。
+  1. 先调度 RUNNING 请求
+     - 单 token 且位置已过 prompt 区 → decode 路径（可进 P7 图）
+     - 多 token chunk / prompt 区单 token → varlen prefill 路径
+     - block 不足时抢占自身（free → reset → 放回 waiting 队首）——唯一抢占路径
+  2. 再调度 WAITING 请求（首个 chunk，用剩余 budget）
+     - block 不足时停止准入（**不抢占 running**，R2 修订，对齐 vLLM：
+       抢占只发生在 RUNNING 段；waiting 靠 running 完成后自然释放的块入场）
+  3. token budget 统一记账（Branch 3）：Σ(chunk) ≤ max_num_batched_tokens
   4. watermark 预留（Branch 3）：空闲块 - 需求 < watermark 时不分配
+  5. R2 准入守卫：add_request 拒绝「独占全池也无法完成」的请求（防 livelock）
 
 A6 节流阀（对齐 vLLM scheduler 标配）:
   - `long_prefill_token_threshold`：单请求一步最多吃多少 prefill token（0 = 关闭，vLLM 默认）。
@@ -37,17 +43,34 @@ from nano_vllm.engine.sequence import Sequence, SequenceStatus
 
 @dataclass
 class ScheduledSeq:
-    """单个请求在一个 step 内的调度决策。"""
+    """单个请求在一个 step 内的调度决策。
+
+    统一记账（抢占恢复对齐 vLLM）后，`num_scheduled_tokens` 不再依赖
+    "prefill/decode 阶段"，而恒等于 `num_new_tokens = num_tokens - num_computed_tokens`
+    （被 token budget / 节流阀截断）——稳态 decode 时它天然等于 1，
+    抢占恢复后的追赶段则可能 > 1。
+    """
 
     seq: Sequence
-    num_tokens: int
+    num_scheduled_tokens: int
     is_prefill: bool
+    """**路由标记**（不是阶段标记）：True = 本 chunk 走 varlen prefill 路径。
+
+    判据见 `Scheduler._use_prefill_route`：多 token chunk，或单 token 但位置
+    仍在 prompt 区（末尾 prompt token）。其余走 decode 路径（可进 P7 的图）。
+    """
 
     @property
-    def is_last_prefill_chunk(self) -> bool:
-        """是否为 prefill 的最后一块（算完这块 prefill 就结束）。"""
-        return self.is_prefill and (
-            self.seq.num_computed_tokens + self.num_tokens >= self.seq.num_prompt_tokens
+    def samples_this_step(self) -> bool:
+        """本 chunk 是否要采样：其终点到达**已知 token 流末尾** `seq.num_tokens`。
+
+        - 稳态 decode：`computed == num_tokens - 1`，+1 恰好到达 → 采样（产出下一个）
+        - 抢占恢复追赶：只有最后一段到达末尾才采样（中间段纯重算 KV，不采样）
+        - 因此"重算 output 区间"不会重复产出 token
+        """
+        return (
+            self.seq.num_computed_tokens + self.num_scheduled_tokens
+            >= self.seq.num_tokens
         )
 
 
@@ -58,7 +81,7 @@ class SchedulerOutput:
 
     @property
     def num_batched_tokens(self) -> int:
-        return sum(s.num_tokens for s in self.scheduled)
+        return sum(s.num_scheduled_tokens for s in self.scheduled)
 
     @property
     def num_prefills(self) -> int:
@@ -132,6 +155,23 @@ class Scheduler:
         return (seq_len + self.block_size - 1) // self.block_size
 
     def add_request(self, seq: Sequence) -> None:
+        """请求入队（R2 守卫：单请求自身可行性检查）。
+
+        请求最大长度（prompt + max_new_tokens）所需的块数超过**全池总量**时，
+        即使抢占掉所有其他请求、独占整池也永远无法完成——入队只会导致
+        调度循环里「抢占 → 重算 → 再抢占」的 livelock。对齐 vLLM：请求无法
+        被调度时最终会以失败结束而不是无限空转，这里在准入时直接拒绝。
+        """
+        need = self.blocks_needed(seq.num_prompt_tokens + seq.sampling_params.max_new_tokens)
+        if need > self.paged_cache.pool.num_blocks:
+            raise ValueError(
+                f"请求 #{seq.seq_id} 最大长度 "
+                f"{seq.num_prompt_tokens}(prompt)+{seq.sampling_params.max_new_tokens}(max_new)"
+                f" = {seq.num_prompt_tokens + seq.sampling_params.max_new_tokens} token"
+                f" 需 {need} 块，超过块池总量 {self.paged_cache.pool.num_blocks} 块——"
+                f"独占全池也无法完成，拒绝入队（防 livelock）。"
+                f"可增大 num_blocks 或减小 max_new_tokens。"
+            )
         self.waiting.append(seq)
 
     def has_requests(self) -> bool:
@@ -182,13 +222,23 @@ class Scheduler:
 
         使用 `seq.prefix_cache_extra_keys` 作为额外 hash key，保证「token 相同但 KV 不该
         共享」（LoRA adapter 等）的请求查不到对方的块。
+
+        R1 钳制（对齐 vLLM `kv_cache_manager.get_computed_blocks` 的 `num_tokens - 1`）:
+        命中最多覆盖 `num_tokens - 1` 个 token，保证至少重算最后一个 token 以产出
+        logits。否则同 prompt 重放且长度恰为 block_size 整数倍时，命中覆盖整个 prompt
+        → `num_new_tokens == 0` → 空前向 / 永不产出首 token。
+
+        注: 抢占恢复对齐后，token 流是 **prompt + 已生成**（`Sequence.all_token_ids`），
+        故钳制用 `num_tokens - 1`（新请求 output 为空时与 `num_prompt_tokens - 1` 等价，
+        恢复时能复用已生成 token 的块 → 重算量 ≤ 1 个 block）。
         """
         if self.prefix_cache is None:
             return CacheHit([], 0, False, None)
         self.prefix_lookups += 1
-        self.prefix_query_tokens += seq.num_prompt_tokens
+        self.prefix_query_tokens += seq.num_tokens
         return self.prefix_cache.find_longest_hit(
-            seq.prompt_token_ids, seq.prefix_cache_extra_keys
+            seq.all_token_ids, seq.prefix_cache_extra_keys,
+            max_tokens=seq.num_tokens - 1,
         )
 
     def _attach_hit_blocks(self, seq: Sequence, hit: CacheHit) -> None:
@@ -261,19 +311,18 @@ class Scheduler:
         scheduled: list[ScheduledSeq] = []
         preempted_ids: list[int] = []
 
-        # ---- 1. 调度 RUNNING（decode 优先 + in-progress prefill chunk）----
+        # ---- 1. 调度 RUNNING（统一记账：追赶 chunk 与 decode 同一公式）----
         for seq in list(self.running):
             if token_budget <= 0:
                 break
 
-            if seq.is_prefill:
-                num_new = min(seq.num_new_tokens, token_budget)
-                if self.long_prefill_token_threshold is not None:
-                    num_new = min(num_new, self.long_prefill_token_threshold)
-                is_prefill = True
-            else:
-                num_new = 1
-                is_prefill = False
+            # num_new_tokens = num_tokens - num_computed_tokens：
+            #   稳态 decode（computed == num_tokens-1）→ 1
+            #   抢占恢复追赶（computed 落后）→ 整段（受 budget / 节流阀截断）
+            num_new = min(seq.num_new_tokens, token_budget)
+            if self.long_prefill_token_threshold is not None:
+                num_new = min(num_new, self.long_prefill_token_threshold)
+            is_prefill = self._use_prefill_route(seq, num_new)
 
             if not self.allocate_slots(seq, num_new):
                 self._preempt(seq)
@@ -295,25 +344,36 @@ class Scheduler:
                 num_new = min(num_new, self.long_prefill_token_threshold)
 
             if not self.allocate_slots(seq, num_new):
-                if self.running:
-                    victim = self.running[-1]
-                    for i, s in enumerate(scheduled):
-                        if s.seq is victim:
-                            token_budget += s.num_tokens
-                            scheduled.pop(i)
-                            break
-                    self._preempt(victim)
-                    preempted_ids.append(victim.seq_id)
-                    continue
+                # R2 修订（对齐 vLLM）: waiting 请求**不抢占** running。
+                # vLLM 中抢占只发生在 RUNNING 调度段（allocate_slots 失败时），waiting 段
+                # 块不足直接停止准入、等 running 自然释放（vllm scheduler: 本步发生抢占
+                # 后不再调度 waiting）。原实现「waiting 抢占 running 最新者」在组合需求
+                # 超过池容量时会互相 ping-pong（A 抢 B → B 重算 → B 抢 A → …），
+                # 双方都到不了 max_new_tokens → livelock。代价是长 running 会暂时
+                # 饿死 waiting（有界：running 必在 max_new_tokens 内完成并释放）。
                 break
 
             seq.status = SequenceStatus.RUNNING
             self.waiting.popleft()
             self.running.append(seq)
-            scheduled.append(ScheduledSeq(seq, num_new, True))
+            scheduled.append(
+                ScheduledSeq(seq, num_new, self._use_prefill_route(seq, num_new))
+            )
             token_budget -= num_new
 
         return SchedulerOutput(scheduled, preempted_ids)
+
+    @staticmethod
+    def _use_prefill_route(seq: Sequence, num_new: int) -> bool:
+        """本 chunk 是否走 varlen prefill 路径（对齐 vLLM 的"按 token 数路由"）。
+
+        | 情形 | 路由 | 理由 |
+        | --- | --- | --- |
+        | `num_new > 1`（新请求 prefill / 抢占恢复追赶段） | prefill | 多 token 需 chunk 内 causal |
+        | `num_new == 1` 且位置在 **prompt 区**（末尾 prompt token） | prefill | **保持与改动前一致的 kernel 选择**，避免数值路径变化 |
+        | `num_new == 1` 且位置在 output 区（稳态 decode / 尾部追赶） | decode | 单 token + 全历史 KV，可进 P7 图 |
+        """
+        return num_new > 1 or seq.num_computed_tokens < seq.num_prompt_tokens
 
     def update_from_output(
         self,
@@ -332,7 +392,7 @@ class Scheduler:
         finished: list[Sequence] = []
         for s in scheduler_output.scheduled:
             seq = s.seq
-            seq.num_computed_tokens += s.num_tokens
+            seq.num_computed_tokens += s.num_scheduled_tokens
 
             new_token = sampled_tokens.get(seq.seq_id)
             if new_token is not None:

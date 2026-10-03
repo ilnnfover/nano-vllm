@@ -176,11 +176,19 @@ class BlockPool:
                 self._hash_index[h] = dst_block_id
 
     def _evict_hashes(self, block_id: int) -> None:
-        """块被重新分配（覆写）前，从 hash 索引移除它的所有 hash。"""
+        """块被重新分配（覆写）前，从 hash 索引移除它的所有 hash。
+
+        守卫: 仅当索引项确实指向本块时才 pop。同内容块被重算并重新注册后，
+        `_hash_index[h]` 会指向**新块**，而旧块仍残留同名 `block_hash`——若不加
+        守卫，旧块被重新分配时会误删新块的注册（命中丢失，只损性能不算错）。
+        典型触发: 同 prompt 重放（R1 场景）下 block 0 的 hash 先指向旧块、再指向新块。
+        """
         blk = self.blocks[block_id]
         if blk.block_hash is not None:
-            self._hash_index.pop(blk.block_hash, None)
+            if self._hash_index.get(blk.block_hash) == block_id:
+                self._hash_index.pop(blk.block_hash, None)
             blk.block_hash = None
             blk.block_hash_num_tokens = None
         for h in self._block_hashes.pop(block_id, ()):
-            self._hash_index.pop(h, None)
+            if self._hash_index.get(h) == block_id:
+                self._hash_index.pop(h, None)

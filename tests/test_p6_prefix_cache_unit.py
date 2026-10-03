@@ -16,7 +16,7 @@ import pytest
 import torch
 
 from nano_vllm.engine.scheduler import Scheduler
-from nano_vllm.engine.sequence import Sequence
+from nano_vllm.engine.sequence import SamplingParams, Sequence
 from nano_vllm.engine.stats import EngineCoreStats
 from nano_vllm.kvmm.block_pool import BlockPool
 from nano_vllm.kvmm.paged_kv_cache import PagedKVCache
@@ -346,7 +346,10 @@ class TestSchedulerPrefixStats:
         cached = [1, 2, 3, 4]
         bid = self._seed_cached_block(paged, cached)
 
-        seq = Sequence(seq_id=0, prompt_token_ids=cached + [5, 6, 7, 8])
+        seq = Sequence(
+            seq_id=0, prompt_token_ids=cached + [5, 6, 7, 8],
+            sampling_params=SamplingParams(max_new_tokens=8),  # R2 守卫: 显式 max_new 适配小池
+        )
         sched.add_request(seq)
         sched.schedule()
 
@@ -363,7 +366,10 @@ class TestSchedulerPrefixStats:
         """未命中：查询计数增加但命中为 0。"""
         _, sched = self._make_scheduler()
 
-        seq = Sequence(seq_id=0, prompt_token_ids=[100, 101, 102, 103, 104, 105, 106, 107])
+        seq = Sequence(
+            seq_id=0, prompt_token_ids=[100, 101, 102, 103, 104, 105, 106, 107],
+            sampling_params=SamplingParams(max_new_tokens=8),
+        )
         sched.add_request(seq)
         sched.schedule()
 
@@ -378,7 +384,10 @@ class TestSchedulerPrefixStats:
         _, sched = self._make_scheduler(enable=False)
 
         assert sched.prefix_cache is None
-        seq = Sequence(seq_id=0, prompt_token_ids=[1, 2, 3, 4, 5, 6, 7, 8])
+        seq = Sequence(
+            seq_id=0, prompt_token_ids=[1, 2, 3, 4, 5, 6, 7, 8],
+            sampling_params=SamplingParams(max_new_tokens=8),
+        )
         sched.add_request(seq)
         sched.schedule()
 
@@ -391,7 +400,10 @@ class TestSchedulerPrefixStats:
         """reset_prefix_stats 清零全部计数。"""
         paged, sched = self._make_scheduler()
         self._seed_cached_block(paged, [1, 2, 3, 4])
-        seq = Sequence(seq_id=0, prompt_token_ids=[1, 2, 3, 4, 5, 6, 7, 8])
+        seq = Sequence(
+            seq_id=0, prompt_token_ids=[1, 2, 3, 4, 5, 6, 7, 8],
+            sampling_params=SamplingParams(max_new_tokens=8),
+        )
         sched.add_request(seq)
         sched.schedule()
         assert sched.prefix_hit_tokens == 4
@@ -502,19 +514,27 @@ class TestSchedulerExtraKeysIsolation:
         )
         paged.pool.free_n(bids)
 
-        seq_a = Sequence(seq_id=0, prompt_token_ids=tokens)
+        seq_a = Sequence(
+            seq_id=0, prompt_token_ids=tokens,
+            sampling_params=SamplingParams(max_new_tokens=8),
+        )
         seq_a.prefix_cache_extra_keys = ("lora-a",)
         sched.add_request(seq_a)
         sched.schedule()
-        assert seq_a.num_computed_tokens == 8
-        assert sched.prefix_hit_tokens == 8
+        # R1 钳制: prompt=8 是 block_size=4 的整数倍，全 prompt 命中被钳到 8-1=7
+        # → 只命中 1 个满块（4 token），保证至少重算最后一个 prompt token。
+        assert seq_a.num_computed_tokens == 4
+        assert sched.prefix_hit_tokens == 4
 
-        seq_b = Sequence(seq_id=1, prompt_token_ids=tokens)
+        seq_b = Sequence(
+            seq_id=1, prompt_token_ids=tokens,
+            sampling_params=SamplingParams(max_new_tokens=8),
+        )
         seq_b.prefix_cache_extra_keys = ("lora-b",)
         sched.add_request(seq_b)
         sched.schedule()
         assert seq_b.num_computed_tokens == 0, "不同 extra_keys 不应命中对方的前缀块"
-        assert sched.prefix_hit_tokens == 8, "未命中不应增加命中计数"
+        assert sched.prefix_hit_tokens == 4, "未命中不应增加命中计数"
 
     def test_scheduler_salt_inherited_from_prefix_cache(self):
         """Scheduler 的 prefix_cache_salt 透传到 PrefixCache。"""

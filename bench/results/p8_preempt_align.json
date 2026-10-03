@@ -1,0 +1,36 @@
+{
+  "model": "models/Qwen2.5-1.5B-Instruct",
+  "device": "cuda",
+  "dtype": "torch.bfloat16",
+  "num_blocks": 20,
+  "prompt_len": 48,
+  "num_requests": 6,
+  "max_new_tokens": 32,
+  "repeat": 3,
+  "gpu": "NVIDIA GeForce RTX 4070 Ti SUPER",
+  "torch": "2.14.0+cu130",
+  "legacy": {
+    "preempt_count": 18,
+    "resume_recompute_tokens": 352,
+    "prefill_tokens": 640,
+    "decode_tokens": 202,
+    "forward_tokens": 842,
+    "wall_ms": 3213.5849349997443,
+    "output_tokens": 192
+  },
+  "aligned": {
+    "preempt_count": 3,
+    "resume_recompute_tokens": 114,
+    "prefill_tokens": 402,
+    "decode_tokens": 184,
+    "forward_tokens": 586,
+    "wall_ms": 2106.6798039992136,
+    "output_tokens": 192
+  },
+  "outputs_identical": true,
+  "reduction": {
+    "resume_recompute_tokens_before": 352,
+    "resume_recompute_tokens_after": 114,
+    "reduction_x": 3.087719298245614
+  }
+}

@@ -47,7 +47,7 @@ class TestLongPrefillThreshold:
 
         out = sched.schedule()
         assert len(out.scheduled) == 1
-        assert out.scheduled[0].num_tokens == 16
+        assert out.scheduled[0].num_scheduled_tokens == 16
 
     def test_chunking_progresses_over_steps(self):
         """连续 3 步各吃 16，prefill 进度逐 step 推进。"""
@@ -67,7 +67,7 @@ class TestLongPrefillThreshold:
         assert sched.long_prefill_token_threshold is None
         sched.add_request(Sequence(seq_id=0, prompt_token_ids=list(range(64))))
         out = sched.schedule()
-        assert out.scheduled[0].num_tokens == 64
+        assert out.scheduled[0].num_scheduled_tokens == 64
 
     def test_default_is_disabled(self):
         """缺省关闭，与 vLLM `SchedulerConfig.long_prefill_token_threshold=0` 一致。"""

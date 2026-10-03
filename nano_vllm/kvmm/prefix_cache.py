@@ -32,14 +32,19 @@ from __future__ import annotations
 import hashlib
 from array import array
 from dataclasses import dataclass
+from typing import Any
 
 from nano_vllm.kvmm.block_pool import BlockPool
+
+# 请求级额外 hash key（LoRA adapter id / 多模态 hash / 命名空间等）：内容对引擎**不透明**，
+# 只需**顺序稳定**且可 repr（见 `compute_block_hash`），故用 `Any` 不做过窄约束。
+ExtraKeys = tuple[Any, ...]
 
 
 def compute_block_hash(
     token_ids: list[int],
     prev_hash: bytes | None,
-    extra_keys: tuple = (),
+    extra_keys: ExtraKeys = (),
 ) -> bytes:
     """滚动块 hash: sha256(prev_hash || token_ids 字节 || extra_keys)。
 
@@ -99,13 +104,24 @@ class PrefixCache:
             hashlib.sha256(f"nano-vllm-prefix-salt:{salt}".encode()).digest() if salt else None
         )
 
-    def find_longest_hit(self, token_ids: list[int], extra_keys: tuple = ()) -> CacheHit:
+    def find_longest_hit(
+        self,
+        token_ids: list[int],
+        extra_keys: ExtraKeys = (),
+        max_tokens: int | None = None,
+    ) -> CacheHit:
         """逐块算滚动 hash 查索引，返回最长命中前缀。
 
         只命中注册过 hash 的**满块**（partial 块不注册，故 is_partial 恒 False）。
         保留 partial 判断逻辑作为设计参考（若将来启用 fine-grained hash 则复用）。
 
         extra_keys 必须与注册时一致，否则查不到（这正是「token 相同但不该共享」的机制）。
+
+        max_tokens: 命中最多覆盖的 token 数（R1 钳制，对齐 vLLM
+        `kv_cache_manager.get_computed_blocks` 的 `num_tokens - 1`）。调用方传
+        `num_prompt_tokens - 1`，保证至少重算最后一个 prompt token 以产出首 token
+        logits——否则同 prompt 重放且长度恰为 block_size 整数倍时，命中会覆盖整个
+        prompt，`num_new_tokens == 0`，出现空前向 / 永不产出首 token。
         """
         bs = self.block_size
         if not token_ids:
@@ -119,6 +135,8 @@ class PrefixCache:
         for i in range(n_blocks):
             start = i * bs
             end = min(start + bs, len(token_ids))
+            if max_tokens is not None and end > max_tokens:
+                break
             prev = compute_block_hash(token_ids[start:end], prev, extra_keys)
             bid = self.pool.get_block_id_by_hash(prev)
             if bid is None:
@@ -137,7 +155,7 @@ class PrefixCache:
         num_full_blocks: int,
         start_block: int,
         prev_hash: bytes | None,
-        extra_keys: tuple = (),
+        extra_keys: ExtraKeys = (),
     ) -> tuple[int, bytes | None]:
         """为块 [start_block, num_full_blocks) 注册满块 hash（对齐 vLLM cache_blocks）。
 

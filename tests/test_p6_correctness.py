@@ -143,7 +143,7 @@ class TestP6PrefixCacheE2E(unittest.TestCase):
         orig = engine._run_prefill_batched
 
         def wrapped(scheduled_prefills):
-            counter["n"] += sum(s.num_tokens for s in scheduled_prefills)
+            counter["n"] += sum(s.num_scheduled_tokens for s in scheduled_prefills)
             return orig(scheduled_prefills)
 
         engine._run_prefill_batched = wrapped

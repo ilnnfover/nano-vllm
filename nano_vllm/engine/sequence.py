@@ -22,6 +22,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import IntEnum
 
+from nano_vllm.kvmm.prefix_cache import ExtraKeys
+
 
 class SequenceStatus(IntEnum):
     WAITING = 0
@@ -56,7 +58,7 @@ class Sequence:
     num_registered_blocks: int = 0
     last_block_hash: bytes | None = None
     # P6 前缀缓存：请求级额外 hash key，需**顺序稳定**（预留 LoRA / 多模态等场景）
-    prefix_cache_extra_keys: tuple = ()
+    prefix_cache_extra_keys: ExtraKeys = ()
 
     @property
     def num_prompt_tokens(self) -> int:
@@ -76,6 +78,38 @@ class Sequence:
         """是否在 prefill 阶段（尚未算完所有 prompt token）。"""
         return self.num_computed_tokens < self.num_prompt_tokens
 
+    # ---------------- 统一 token 流（抢占恢复对齐 vLLM 的基础） ----------------
+    #
+    # 现状: "输入 token 从哪取"按阶段二分——prefill 取 prompt 切片、decode 取
+    # output[-1]。这使"重算 prompt+output 区间"无法表达（抢占恢复只能清空 output
+    # 从 prompt 重跑，见 docs/notes/preempt-recompute-align.md）。
+    # 统一后: 请求只有一条 token 流 T = prompt + output，一切按**绝对位置**取。
+
+    @property
+    def all_token_ids(self) -> list[int]:
+        """完整 token 流 T = prompt_token_ids + output_token_ids。"""
+        return self.prompt_token_ids + self.output_token_ids
+
+    def input_token_ids(self, start: int, num_tokens: int) -> list[int]:
+        """位置 [start, start+num_tokens) 的输入 token（位置式取法）。
+
+        - 位置 p < len(T)：取真实 token `T[p]`（追赶期 = 重算已知 token 的 KV）
+        - 位置 p >= len(T)：重喂最后一个 token `T[-1]`（decode 的经典动作：
+          用最后一个已知 token 的 logits 产出下一个 token）
+
+        现状两条路径都是本公式的特例：
+          prefill: start..start+k 全在 prompt 内 → `T[p] == prompt_token_ids[p]`
+          decode : start == num_computed_tokens == len(T)-1 且落在 output 内
+                   → `T[-1] == output_token_ids[-1]`
+        """
+        if num_tokens <= 0:
+            return []
+        T = self.all_token_ids
+        if not T:
+            raise ValueError("空 token 流：请求至少要有 1 个 prompt token")
+        last = len(T) - 1
+        return [T[p] if p < last else T[last] for p in range(start, start + num_tokens)]
+
     @property
     def is_finished(self) -> bool:
         return self.status == SequenceStatus.FINISHED
@@ -88,13 +122,16 @@ class Sequence:
         self.output_token_ids.append(token_id)
 
     def reset_for_preemption(self) -> None:
-        """抢占后重置：从头 recompute（Branch 2）。
+        """抢占后重置：丢掉 KV、保留已生成 token，从头重算（对齐 vLLM）。
 
-        P6: 前缀缓存状态也重置——重调度时重新查找命中（大概率命中自己刚释放的前缀块，
-        recompute 降为只重算未命中部分）。block_table 清空，已注册 hash 信息作废。
+        **保留 `output_token_ids`**（vLLM `_preempt_request` 只把
+        `num_computed_tokens` 归零，不动 output）：恢复时按位置式取法重算
+        prompt+output 区间的 KV，命中上界为 `num_tokens - 1` → 重算量 ≤ 1 个 block；
+        且末段的 logits 用于产出**下一个** token，不会重复输出已发过的 token。
+
+        P6: 前缀缓存状态重置——重调度时重新查找命中（命中自己刚释放的块）。
         """
         self.num_computed_tokens = 0
-        self.output_token_ids.clear()
         self.block_table.clear()
         self.status = SequenceStatus.WAITING
         self.prefix_cache_done = False

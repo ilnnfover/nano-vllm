@@ -139,7 +139,12 @@ class EngineCore:
         return finished, sampled
 
     def _execute(self, scheduler_output: SchedulerOutput) -> dict[int, int]:
-        """执行模型前向，返回 {seq_id: sampled_token_id}。"""
+        """执行模型前向，返回 {seq_id: sampled_token_id}。
+
+        采样判据统一为 `ScheduledSeq.samples_this_step`（chunk 终点到达已知 token 流
+        末尾才采样）——前向对**全部**被调度的请求执行（KV 必须写），只是不一定采样：
+        抢占恢复的中间追赶段只重算 KV，末段才产出下一个 token。
+        """
         sampled: dict[int, int] = {}
         prefill_seqs = [s for s in scheduler_output.scheduled if s.is_prefill]
         decode_seqs = [s for s in scheduler_output.scheduled if not s.is_prefill]
@@ -147,32 +152,37 @@ class EngineCore:
         if prefill_seqs:
             if self.prefill_mode == "per-seq":
                 for s in prefill_seqs:
-                    logits = self._run_prefill(s.seq, s.num_tokens)
-                    if s.is_last_prefill_chunk:
+                    logits = self._run_prefill(s.seq, s.num_scheduled_tokens)
+                    if s.samples_this_step:
                         sampled[s.seq.seq_id] = self._sample(s.seq, logits)
             else:
                 logits_map = self._run_prefill_batched(prefill_seqs)
                 for s in prefill_seqs:
-                    if s.is_last_prefill_chunk:
+                    if s.samples_this_step:
                         seq = s.seq
                         sampled[seq.seq_id] = self._sample(seq, logits_map[seq.seq_id])
 
         if len(decode_seqs) == 1:
-            seq = decode_seqs[0].seq
-            logits = self._run_decode(seq)
-            sampled[seq.seq_id] = self._sample(seq, logits)
+            s = decode_seqs[0]
+            logits = self._run_decode(s.seq)
+            if s.samples_this_step:
+                sampled[s.seq.seq_id] = self._sample(s.seq, logits)
         elif len(decode_seqs) > 1:
             seqs = [s.seq for s in decode_seqs]
             logits_list = self._run_decode_batched(seqs)
+            # 仅对"到达流末尾"的请求采样（budget=1 时追赶段可能只走 1 token 且未到末尾）
+            idx = [i for i, s in enumerate(decode_seqs) if s.samples_this_step]
+            sample_seqs = [seqs[i] for i in idx]
+            sample_logits = [logits_list[i] for i in idx]
             # A2: 批量 greedy 采样（一次 argmax 替代逐条 int() 的 N 次同步）
-            all_greedy = all(seq.sampling_params.temperature <= 0.0 for seq in seqs)
+            all_greedy = all(seq.sampling_params.temperature <= 0.0 for seq in sample_seqs)
             if all_greedy:
-                logits_batch = torch.stack(logits_list)
+                logits_batch = torch.stack(sample_logits)
                 token_ids = self.runner.sampler.batch_sample_greedy(logits_batch)
-                for seq, tid in zip(seqs, token_ids):
+                for seq, tid in zip(sample_seqs, token_ids):
                     sampled[seq.seq_id] = tid
             else:
-                for seq, logits in zip(seqs, logits_list):
+                for seq, logits in zip(sample_seqs, sample_logits):
                     sampled[seq.seq_id] = self._sample(seq, logits)
 
         return sampled
@@ -187,9 +197,14 @@ class EngineCore:
 
     @torch.no_grad()
     def _run_prefill(self, seq: Sequence, num_tokens: int) -> torch.Tensor:
-        """执行 prefill chunk：处理 prompt[num_computed : num_computed+num_tokens]。"""
+        """执行 prefill chunk：处理位置 [num_computed, num_computed+num_tokens)。
+
+        token 取法为**位置式**（`Sequence.input_token_ids`）——当前 prefill 阶段的
+        chunk 恒落在 prompt 内，故与 `prompt_token_ids[chunk_start:...]` 等价；
+        统一取法是为抢占恢复能重算 output 区间做准备。
+        """
         chunk_start = seq.num_computed_tokens
-        chunk_ids = seq.prompt_token_ids[chunk_start : chunk_start + num_tokens]
+        chunk_ids = seq.input_token_ids(chunk_start, num_tokens)
         total_seq_len = chunk_start + num_tokens
 
         input_ids = torch.tensor([chunk_ids], dtype=torch.long, device=self.device)
@@ -232,7 +247,7 @@ class EngineCore:
             {seq_id: last_token_logits}，仅含产生输出的请求（last prefill chunk）
         """
         seqs = [s.seq for s in scheduled_prefills]
-        num_tokens_list = [s.num_tokens for s in scheduled_prefills]
+        num_tokens_list = [s.num_scheduled_tokens for s in scheduled_prefills]
 
         input_ids: list[int] = []
         position_ids: list[int] = []
@@ -243,8 +258,7 @@ class EngineCore:
 
         for seq, num_tokens in zip(seqs, num_tokens_list):
             chunk_start = seq.num_computed_tokens
-            chunk_ids = seq.prompt_token_ids[chunk_start : chunk_start + num_tokens]
-            input_ids.extend(chunk_ids)
+            input_ids.extend(seq.input_token_ids(chunk_start, num_tokens))
             position_ids.extend(range(chunk_start, chunk_start + num_tokens))
             slot_mappings.append(self.runner.paged_cache.slot_mapping(
                 seq.block_table, chunk_start, num_tokens
@@ -296,9 +310,14 @@ class EngineCore:
 
     @torch.no_grad()
     def _run_decode(self, seq: Sequence) -> torch.Tensor:
-        """执行 decode：处理最后生成的 1 个 token。"""
-        token_id = seq.output_token_ids[-1]
+        """执行 decode：处理位置 `num_computed_tokens`（稳态即"最后生成的 token"）。
+
+        位置式取法与 `output_token_ids[-1]` 等价（稳态 `computed == num_tokens - 1`
+        且该位置落在 output 内），但前者也能覆盖"位置落在 prompt 内"的单 token chunk
+        （末尾 prompt token 的追赶），为抢占恢复铺路。
+        """
         pos = seq.num_computed_tokens
+        token_id = seq.input_token_ids(pos, 1)[0]
         new_seq_len = pos + 1
 
         input_ids = torch.tensor([[token_id]], dtype=torch.long, device=self.device)
@@ -336,7 +355,7 @@ class EngineCore:
         """批量 decode：多条序列一次 model forward，attention 内部逐条 gather KV。"""
         b = len(seqs)
         input_ids = torch.tensor(
-            [[seq.output_token_ids[-1]] for seq in seqs],
+            [[seq.input_token_ids(seq.num_computed_tokens, 1)[0]] for seq in seqs],
             dtype=torch.long, device=self.device,
         )
         position_ids = torch.tensor(
