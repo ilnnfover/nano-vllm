@@ -46,7 +46,7 @@ def create_app(
     attn_impl: str = "torch",
     prefill_impl: str = "torch",
     prejoin: bool = True,
-    fused_norm: bool = True,
+    norm_impl: str = "triton",
     prefill_mode: str = "batched",
     enable_prefix_cache: bool = True,
     max_num_seqs: int | None = None,
@@ -58,7 +58,7 @@ def create_app(
         model_path, device=device, dtype=dt,
         max_seq_len=max_seq_len, block_size=block_size, num_blocks=num_blocks,
         attn_impl=attn_impl, prefill_impl=prefill_impl,
-        prejoin=prejoin, fused_norm=fused_norm,
+        prejoin=prejoin, norm_impl=norm_impl,
     )
     scheduler = Scheduler(
         paged_cache=runner.paged_cache,
@@ -167,8 +167,8 @@ def main() -> None:
     p.add_argument("--prefill-mode", default="batched", choices=["batched", "per-seq"])
     p.add_argument("--prejoin", action=argparse.BooleanOptionalAction, default=True,
                    help="P8 权重预拼接（QKV 3→1 / gate-up 2→1）；用 --no-prejoin 做拼接前后对照")
-    p.add_argument("--fused-norm", action=argparse.BooleanOptionalAction, default=True,
-                   help="P8 RMSNorm 融合（逐 op → 单 kernel）；用 --no-fused-norm 做融合前后对照")
+    p.add_argument("--norm-impl", default="triton", choices=["torch", "lib", "triton"],
+                   help="RMSNorm 实现：torch（逐 op oracle）/ lib（F.rms_norm）/ triton（自研融合核）")
     p.add_argument("--no-prefix-cache", dest="enable_prefix_cache", action="store_false",
                    default=True, help="关闭 P6 前缀缓存（默认开启）")
     p.add_argument("--max-num-seqs", type=int, default=None,
@@ -189,7 +189,7 @@ def main() -> None:
         max_seq_len=args.max_seq_len, num_blocks=args.num_blocks,
         max_num_batched_tokens=args.budget, attn_impl=args.attn_impl,
         prefill_impl=args.prefill_impl, prefill_mode=args.prefill_mode,
-        prejoin=args.prejoin, fused_norm=args.fused_norm,
+        prejoin=args.prejoin, norm_impl=args.norm_impl,
         enable_prefix_cache=args.enable_prefix_cache,
         max_num_seqs=args.max_num_seqs,
         long_prefill_token_threshold=args.long_prefill_threshold,

@@ -40,7 +40,7 @@ class NanoRunner:
         attn_impl: str = "torch",
         prefill_impl: str = "torch",
         prejoin: bool = True,
-        fused_norm: bool = True,
+        norm_impl: str = "triton",
         enable_cudagraph: bool | None = None,
         cudagraph_buckets: tuple[int, ...] | None = None,
     ) -> None:
@@ -51,7 +51,10 @@ class NanoRunner:
         self.attn_impl = attn_impl
         self.prefill_impl = prefill_impl
         self.prejoin = prejoin
-        self.fused_norm = fused_norm
+        # P8 ②-b · RMSNorm 三实现对照：torch（逐 op oracle）/ lib（F.rms_norm）/ triton（自研融合核）。
+        # 自研核只在 CUDA 上跑，故非 CUDA **显式降级**到 oracle —— 不做设备相关的静默分支
+        # （P0-07 的教训：数值路径不应随设备悄悄切换）。
+        self.norm_impl = norm_impl if device == "cuda" else "torch"
         self.enable_cudagraph = (
             (device == "cuda" and torch.cuda.is_available() and attn_impl == "triton")
             if enable_cudagraph is None
@@ -60,7 +63,7 @@ class NanoRunner:
         self.cudagraph_buckets = cudagraph_buckets
         self.config = Qwen2Config.from_json(Path(model_path) / "config.json")
         self.model = Qwen2ForCausalLM(
-            self.config, prejoin=prejoin, fused_norm=fused_norm
+            self.config, prejoin=prejoin, norm_impl=self.norm_impl
         ).to(device=device, dtype=dtype).eval()
         self.model.load_weights(model_path)
         self.sampler = Sampler(device)

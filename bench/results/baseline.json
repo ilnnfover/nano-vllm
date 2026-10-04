@@ -1,7 +1,7 @@
 {
   "meta": {
-    "time": "2026-10-04 11:14:32",
-    "git": "c0d622a",
+    "time": "2026-10-04 15:48:29",
+    "git": "3f6d6b2",
     "torch": "2.14.0+cu130",
     "gpu": "NVIDIA GeForce RTX 4070 Ti SUPER",
     "tolerance": 0.3
@@ -16,8 +16,8 @@
     "batch": 8,
     "prompt_len": 64,
     "steps": 30,
-    "eager_ms": 31.673,
-    "graph_ms": 7.305,
-    "graph_speedup": 4.336
+    "eager_ms": 33.746,
+    "graph_ms": 6.816,
+    "graph_speedup": 4.951
   }
 }

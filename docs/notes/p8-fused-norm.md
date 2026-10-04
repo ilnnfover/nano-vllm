@@ -15,7 +15,12 @@
 | 层外 kernel 数 | 22 | **15** | −7（final norm 也走融合） |
 | **P8 累计**（① + ②） | 42.0 | **24.0** | **−18.0（−42.9%）** |
 
-数据：`bench/results/layer_kernels_nofusednorm.json`（前）/ `layer_kernels.json`（后，当前默认）。
+数据：`bench/results/layer_kernels_normtorch.json`（前，38.0）/ `layer_kernels_normlib.json`（后，24.0）。
+
+> **2026-10-04 后续（②-b 已落地）**：手写 Triton 融合核 + 延迟残差把单层从 24.0 推到 **22.0**，
+> 见 `docs/notes/p8-triton-norm.md`。阅读本文时请注意：**本文的 `lib` 就是这个 24.0 档**，
+> 而 `layer_kernels.json`（"当前默认"）已随默认值变更为 `triton` 而变成 **22.0**。
+> 上表的 38.0 ↔ 24.0 仍是一组有效的单变量对照（差别只在 norm 实现），只是当时还没有 ②-b。
 
 ---
 
@@ -153,9 +158,10 @@ def forward(self, hidden_states):
 
 ## 8. 遗留
 
-1. **②-b：手写 Triton `fused_add_rms_norm`**，把 residual 加折进 norm 核
-   （预估再 −2/层：每层 2 处 residual `aten::add`）。收益不大但这是 roadmap 字面要求的那一项；
-   做完后单层应到 ~22。
+1. ~~**②-b：手写 Triton `fused_add_rms_norm`**，把 residual 加折进 norm 核~~
+   —— **已完成**（2026-10-04），见 `docs/notes/p8-triton-norm.md`。
+   实测 24.0 → **22.0**（−2/层，与预估一致）；但 §6 那条**性能账有正有负**：图开赢 3.4%、
+   eager 输 4.4%，原因与"一行一个 program 导致小 row 数下 SM 欠占"有关，已在那边记录。
 2. **`F.rms_norm` 的 eps 语义**：`torch.rms_norm` 用 `rsqrt(mean(x²) + eps)`，与逐 op 版一致；
    但若后续换别的模型（如对 eps 位置更敏感的实现），需要重新对拍。
 3. **`_sdpa` 的 host 分支仍未收敛**（`qwen2.py` 里 `if self.num_kv_groups > 1 and q.is_cuda ...`）——

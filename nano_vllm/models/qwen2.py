@@ -21,6 +21,7 @@ from nano_vllm.attention.triton_paged_attn import (
 )
 from nano_vllm.attention.varlen_prefill import varlen_prefill_attention
 from nano_vllm.config import Qwen2Config
+from nano_vllm.ops.fused_norm import fused_add_rms_norm, rms_norm
 
 
 # ------------------------------------------------------- P8 · 权重预拼接（load 期）
@@ -75,21 +76,60 @@ def _prejoin_state_dict(weights: dict[str, torch.Tensor]) -> dict[str, torch.Ten
 
 
 class RMSNorm(nn.Module):
-    def __init__(self, hidden_size: int, eps: float = 1e-6, fused: bool = True) -> None:
+    """三实现对拍（`impl` 由 `NanoRunner(norm_impl=...)` 选择）：
+
+    | impl | 实现 | 每层 norm 相关 kernel |
+    | --- | --- | --- |
+    | `torch` | 逐 op（与 HF `Qwen2RMSNorm` 逐行对齐）—— **oracle**，不参与性能路径 | 8/次 |
+    | `lib` | `F.rms_norm`（库融合核） | 1/次 |
+    | `triton` | `nano_vllm/ops/fused_norm.py` 自研核，**并把残差加一起融掉** | 1/次（含加） |
+    """
+
+    def __init__(self, hidden_size: int, eps: float = 1e-6, impl: str = "triton") -> None:
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
-        self.fused = fused
+        self.impl = impl
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if self.fused:
-            # P8 ② · 融合路径：`F.rms_norm` 内部按 fp32 累加均方，整条 RMSNorm 落到
-            # **单个** elementwise kernel；下面逐 op 版实测约 7 个 kernel。
-            # 数值口径一致（fp32 累加 + rsqrt + eps），差异仅来自归约顺序。
+        """纯 RMSNorm（没有可融合的残差加）。第 0 层的 `input_layernorm` 用它。"""
+        if self.impl == "triton":
+            return rms_norm(hidden_states, self.weight, self.variance_epsilon)
+        if self.impl == "lib":
             return F.rms_norm(
                 hidden_states, (self.weight.numel(),), self.weight, self.variance_epsilon
             )
-        # 逐 op 版：与 HF `Qwen2RMSNorm` 逐行对齐，留作对拍基准（roadmap §6 两遍实现法）
+        return self._op_norm(hidden_states)
+
+    def forward_with_residual(
+        self, hidden_states: torch.Tensor, residual: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """融合「残差加」与随后的 RMSNorm，返回 `(norm(x), x)`，其中 `x = residual + hidden_states`。
+
+        **延迟残差设计的落点**：第二个返回值要作为下一个残差段继续往下传。本层欠的
+        `y = residual + mlp_out` 这个加法，被推迟到下一层（或 `Qwen2Model.norm`）的 norm 里
+        顺手做掉 —— 于是每层的两次「加 + 归一」各变成**一次**调用，而不是两次。
+        """
+        if self.impl == "triton":
+            # 一个核同时算 x+residual、把 x 存回、并对它做归一
+            return fused_add_rms_norm(
+                hidden_states, residual, self.weight, self.variance_epsilon
+            )
+        x = residual + hidden_states
+        if self.impl == "lib":
+            return (
+                F.rms_norm(x, (self.weight.numel(),), self.weight, self.variance_epsilon),
+                x,
+            )
+        return self._op_norm(x), x
+
+    def _op_norm(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """逐 op 版（oracle）：与 HF `Qwen2RMSNorm` 逐行对齐，供另外两条路径对拍。
+
+        注意它在**加法之后才转 bf16**：`x` 先落成 bf16、再读回来算方差，比融合核多一次舍入
+        （融合核让加法与归约共享同一份 fp32 中间值）。所以对拍时它是"精度较低的一方"，
+        详见 `docs/notes/p8-triton-norm.md`。
+        """
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
@@ -419,12 +459,32 @@ class MLP(nn.Module):
 
 
 class DecoderLayer(nn.Module):
-    def __init__(self, config: Qwen2Config, prejoin: bool = True, fused_norm: bool = True) -> None:
+    """**延迟残差（deferred residual）** 版 decoder layer。
+
+    与教科书写法（每层自己收口两次 `x = residual + sublayer(x)`）的区别：
+
+        教科书:  residual = x; h = norm(x);  h = attn(h);  x = residual + h      ← 独立 add
+                 residual = x; h = norm(x);  h = mlp(h);   x = residual + h      ← 独立 add
+        本实现:  (h, x) = fused_add_norm(attn_out, residual)   ← 加+归一并成一个核
+                 (h, x) = fused_add_norm(mlp_out,  residual)   ← 同上
+                 最后把「欠的」最后一次加交给下一层（或 final norm）收口
+
+    每层因此少两次独立 `aten::add`（以及它带的一次显存往返）。对齐 vLLM
+    `LlamaDecoderLayer.forward` 的做法：`residual` 作为**入参**传进来。
+    """
+
+    def __init__(
+        self, config: Qwen2Config, prejoin: bool = True, norm_impl: str = "triton"
+    ) -> None:
         super().__init__()
         self.self_attn = Attention(config, prejoin)
         self.mlp = MLP(config, prejoin)
-        self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps, fused_norm)
-        self.post_attention_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps, fused_norm)
+        self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps, norm_impl)
+        self.post_attention_layernorm = RMSNorm(
+            config.hidden_size, config.rms_norm_eps, norm_impl
+        )
+        # 延迟残差只有在 norm 能融合「加」时才省得下来；torch 逐 op 路径下等价于原写法
+        self.deferred_residual = norm_impl in ("triton", "lib")
 
     def forward(
         self,
@@ -437,32 +497,45 @@ class DecoderLayer(nn.Module):
         attn_mask: torch.Tensor | None = None,
         paged_cache=None,
         metadata: AttentionMetadata | None = None,
-    ) -> torch.Tensor:
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
+        residual: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """返回 `(hidden_states, residual)`；调用方负责最后的 `residual + hidden_states`。
+
+        `residual is None` 只出现在第 0 层：那时还没有欠账的残差，`input_layernorm`
+        无从融合（这一层的 norm 只能单独跑）——对齐 vLLM 同处的分支。
+        """
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm.forward_with_residual(
+                hidden_states, residual
+            )
+
         hidden_states = self.self_attn(
             hidden_states, position_embeddings,
             kv_cache=kv_cache, layer_idx=layer_idx,
             is_prefill=is_prefill, cache_seq_len=cache_seq_len,
             attn_mask=attn_mask, paged_cache=paged_cache, metadata=metadata,
         )
-        hidden_states = residual + hidden_states
-
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states, residual = self.post_attention_layernorm.forward_with_residual(
+            hidden_states, residual
+        )
         hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
-        return hidden_states
+        # 「y = residual + mlp_out」不在这里做：留给下一层的 norm（或 final norm）收口
+        return hidden_states, residual
 
 
 class Qwen2Model(nn.Module):
-    def __init__(self, config: Qwen2Config, prejoin: bool = True, fused_norm: bool = True) -> None:
+    def __init__(
+        self, config: Qwen2Config, prejoin: bool = True, norm_impl: str = "triton"
+    ) -> None:
         super().__init__()
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList(
-            DecoderLayer(config, prejoin, fused_norm) for _ in range(config.num_hidden_layers)
+            DecoderLayer(config, prejoin, norm_impl) for _ in range(config.num_hidden_layers)
         )
-        self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps, fused_norm)
+        self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps, norm_impl)
         self.rotary_emb = RotaryEmbedding(config.head_dim, config.rope_theta)
 
     def forward(
@@ -487,29 +560,39 @@ class Qwen2Model(nn.Module):
         all_hidden: list[torch.Tensor] | None = (
             [hidden_states] if output_hidden_states else None
         )
+        # 延迟残差：residual 逐层往下传，每层「欠」的那次加法由下一层（最后一层由 final norm）收口
+        residual: torch.Tensor | None = None
         for layer_idx, layer in enumerate(self.layers):
-            hidden_states = layer(
+            hidden_states, residual = layer(
                 hidden_states, position_embeddings,
                 kv_cache=kv_cache, layer_idx=layer_idx,
                 is_prefill=is_prefill, cache_seq_len=cache_seq_len,
                 attn_mask=attn_mask, paged_cache=paged_cache, metadata=metadata,
+                residual=residual,
             )
             if all_hidden is not None:
-                all_hidden.append(hidden_states)
+                # 本层的真实输出是「收口后」的值 = residual + hidden_states。
+                # 注意：只有开 output_hidden_states（对拍用，非性能路径）时才会付这一次 add。
+                all_hidden.append(
+                    hidden_states if residual is None else residual + hidden_states
+                )
 
-        hidden_states = self.norm(hidden_states)
+        # 最后一层欠的加法与 final norm 一起收口
+        hidden_states = self.norm.forward_with_residual(hidden_states, residual)[0]
         if all_hidden is not None:
             all_hidden[-1] = hidden_states
         return hidden_states, all_hidden
 
 
 class Qwen2ForCausalLM(nn.Module):
-    def __init__(self, config: Qwen2Config, prejoin: bool = True, fused_norm: bool = True) -> None:
+    def __init__(
+        self, config: Qwen2Config, prejoin: bool = True, norm_impl: str = "triton"
+    ) -> None:
         super().__init__()
         self.config = config
         self.prejoin = prejoin
-        self.fused_norm = fused_norm
-        self.model = Qwen2Model(config, prejoin, fused_norm)
+        self.norm_impl = norm_impl
+        self.model = Qwen2Model(config, prejoin, norm_impl)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         if config.tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight

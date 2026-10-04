@@ -62,8 +62,16 @@ _EXCLUDE_PREFIX = ("Memcpy", "Memset", "record_function")
 
 
 def id_patch(*args, **kwargs):
-    """DecoderLayer 的 identity 替身：直接把 hidden_states 原样返回。"""
-    return args[0]
+    """DecoderLayer 的 identity 替身：跳过 attention/MLP 与层内 norm，只把残差链传下去。
+
+    延迟残差版的 forward 返回 `(hidden_states, residual)`，这里必须同样返回二元组，
+    否则 `Qwen2Model` 的循环会拿到错的解包结果。`residual` 为 None（第 0 层）时补成同一个
+    张量，好让链路末端的 `final norm` 仍能正常执行 —— 本替身**只用于 kernel 计数**，
+    它产生的数值没有语义（可能变成 `norm(2x)`），不要去解读。
+    """
+    x = args[0]
+    r = kwargs.get("residual")
+    return x, (x if r is None else r)
 
 
 def patch_layers(model, indices) -> None:
@@ -94,7 +102,7 @@ def measure(args, patch: str, device: str, dtype) -> tuple[int, dict[str, int], 
         num_blocks=args.num_blocks,
         attn_impl=args.attn_impl if device == "cuda" else "torch",
         prejoin=args.prejoin,
-        fused_norm=args.fused_norm,
+        norm_impl=args.norm_impl,
         enable_cudagraph=args.cudagraph if device == "cuda" else False,
     )
     sched = Scheduler(
@@ -151,8 +159,8 @@ def main() -> None:
                     help="是否启用 P7 图（仅 attn_impl=triton 生效）")
     ap.add_argument("--prejoin", action=argparse.BooleanOptionalAction, default=True,
                     help="P8 权重预拼接（QKV 3→1 / gate-up 2→1）；--no-prejoin 即拼接前的对照")
-    ap.add_argument("--fused-norm", action=argparse.BooleanOptionalAction, default=True,
-                    help="P8 RMSNorm 融合（逐 op → 单 kernel）；--no-fused-norm 即融合前的对照")
+    ap.add_argument("--norm-impl", default="triton", choices=["torch", "lib", "triton"],
+                    help="RMSNorm 实现：torch（逐 op oracle）/ lib（F.rms_norm）/ triton（自研融合核）")
     ap.add_argument("--quick", action="store_true", help="跳过同构性交叉校验")
     ap.add_argument("--top", type=int, default=15, help="名称分解打印条数")
     ap.add_argument("--tag", default="layer_kernels")
@@ -173,7 +181,7 @@ def main() -> None:
     elapsed = time.perf_counter() - t0
 
     print(f"\n配置: batch={args.batch} attn_impl={args.attn_impl} "
-          f"prejoin={args.prejoin} fused_norm={args.fused_norm} "
+          f"prejoin={args.prejoin} norm_impl={args.norm_impl} "
           f"cudagraph={bool(args.cudagraph and args.attn_impl == 'triton')} "
           f"prompt_len={args.prompt_len}")
     print(f"整模型一步 kernel 数     : {total}")
@@ -199,7 +207,7 @@ def main() -> None:
             "prompt_len": args.prompt_len,
             "attn_impl": args.attn_impl,
             "prejoin": bool(args.prejoin),
-            "fused_norm": bool(args.fused_norm),
+            "norm_impl": args.norm_impl,
             "cudagraph": bool(args.cudagraph and args.attn_impl == "triton"),
             "warmup_steps": args.warmup_steps,
             "layer_idx_for_check": args.layer_idx,
