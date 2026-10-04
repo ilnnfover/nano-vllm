@@ -39,6 +39,7 @@ class NanoRunner:
         num_blocks: int | None = None,
         attn_impl: str = "torch",
         prefill_impl: str = "torch",
+        prejoin: bool = True,
         enable_cudagraph: bool | None = None,
         cudagraph_buckets: tuple[int, ...] | None = None,
     ) -> None:
@@ -48,6 +49,7 @@ class NanoRunner:
         self.block_size = block_size
         self.attn_impl = attn_impl
         self.prefill_impl = prefill_impl
+        self.prejoin = prejoin
         self.enable_cudagraph = (
             (device == "cuda" and torch.cuda.is_available() and attn_impl == "triton")
             if enable_cudagraph is None
@@ -55,7 +57,7 @@ class NanoRunner:
         )
         self.cudagraph_buckets = cudagraph_buckets
         self.config = Qwen2Config.from_json(Path(model_path) / "config.json")
-        self.model = Qwen2ForCausalLM(self.config).to(device=device, dtype=dtype).eval()
+        self.model = Qwen2ForCausalLM(self.config, prejoin=prejoin).to(device=device, dtype=dtype).eval()
         self.model.load_weights(model_path)
         self.sampler = Sampler(device)
         if seed is not None:

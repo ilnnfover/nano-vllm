@@ -119,12 +119,17 @@ roadmap P8 的完成标准是「**单层** kernel launch 数下降 ≥30%（prof
 | --- | --- | --- |
 | 197 | `cutlass::Kernel2` | ~7 个/层：QKV / o_proj / gate / up / down 的 GEMM |
 | 169 + 112 + 59×2 + 57×4 | `elementwise_kernel` 系 | RMSNorm、SiLU、residual 相加 |
-| 56 | `at::native::(anonymous namespace)::CatArrayBatchedCopy` | **2 个/层 = QKV 与 gate/up 的运行时 `cat`** ← P8 权重预拼接要消掉的就是这两个 |
+| 56 | `at::native::(anonymous namespace)::CatArrayBatchedCopy` | **2 个/层 = `rotate_half`(RoPE) 里的 `torch.cat`**（q 与 k 各一次，`qwen2.py`）——归 RoPE 项，**不是**权重预拼接（2026-10-04 更正） |
 | 56 | `index_elementwise_kernel` | KV cache 写入 / slot 相关 |
 | 28 | `_paged_attn_decode_batch_kernel` | 1 个/层 |
 
-即 P8 的「单层 kernel 数下降 ≥30%」目标 ≈ 42 → ≤ 29，主要来源：
-① 消掉 2 个 `CatArrayBatchedCopy`；② RoPE 内联进 QKV 后处理（少 elementwise）；③ RMSNorm/SwiGLU 融合。
+即 P8 的「单层 kernel 数下降 ≥30%」目标 ≈ 42 → ≤ 29。
+
+> **2026-10-04 更正**：原写「消掉 2 个 `CatArrayBatchedCopy` 靠权重预拼接」**是错的**。做完①后实测
+> `CatArrayBatchedCopy` 前后恒为 56（Δ=0）：它来自 `rotate_half` 的 `torch.cat`，属 **RoPE 项的收益**，
+> 与权重预拼接无关。①的真实收益在 **GEMM 数**上：每层 7 个 Linear → 4 个（−3 个 `cutlass::Kernel2`）、
+> 合并后不再触发 split-k（−2 个 `cublasLt::splitKreduce_kernel`）、净增 1 个 elementwise
+> ⇒ **−4/层**（42 → 38）。详见 `docs/notes/p8-prejoin.md`。
 
 ---
 

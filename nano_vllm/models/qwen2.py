@@ -2,9 +2,12 @@
 
 对拍约定: hidden_states[0]=embedding 输出, [1..N]=各 decoder layer 输出（final norm 前）,
 与 HF output_hidden_states 的索引语义一致, 供 golden/check_diff.py 使用。
-权重命名与 HF 完全同名（model.* / lm_head.weight）, 加载近乎恒等映射。
+权重命名**默认**与 HF 完全同名（model.* / lm_head.weight），加载近乎恒等映射；
+P8 的 `prejoin=True` 会把加载改成「同名 + 三处合并」，见 `_prejoin_state_dict`。
 """
 from __future__ import annotations
+
+import re
 
 import torch
 from torch import nn
@@ -18,6 +21,57 @@ from nano_vllm.attention.triton_paged_attn import (
 )
 from nano_vllm.attention.varlen_prefill import varlen_prefill_attention
 from nano_vllm.config import Qwen2Config
+
+
+# ------------------------------------------------------- P8 · 权重预拼接（load 期）
+
+_QKV_KEY = re.compile(
+    r"^(?P<prefix>.+\.self_attn)\.(?P<proj>[qkv])_proj\.(?P<param>weight|bias)$"
+)
+_GATE_UP_KEY = re.compile(r"^(?P<prefix>.+\.mlp)\.(?P<proj>gate|up)_proj\.weight$")
+
+
+def _prejoin_state_dict(weights: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """P8 · 把 HF 的 q/k/v_proj 与 gate/up_proj 权重合并成 qkv_proj / gate_up_proj。
+
+    **合并顺序必须与 `Attention._project_qkv` / `MLP.forward` 的切分一致**：
+
+        qkv     = cat([q, k, v], dim=0)   ← 模型侧 split([q, k, v], dim=-1)
+        gate_up = cat([gate, up], dim=0)  ← 模型侧 split(intermediate, dim=-1)
+
+    两个显式校验（而不是静默跳过）：
+      * Qwen2 的 QKV **带 bias**（Llama 没有，见 roadmap 附录坑点 1），weight 与 bias
+        必须都拼齐，缺一个就报错；
+      * 拼错顺序**不会崩，只会静默算错**，所以这里校验三件套齐全，绝不吞掉异常。
+
+    不参与合并的键（embed_tokens / lm_head / norm 等）原样透传。
+    """
+    out: dict[str, torch.Tensor] = {}
+    qkv: dict[tuple[str, str], dict[str, torch.Tensor]] = {}
+    gate_up: dict[str, dict[str, torch.Tensor]] = {}
+
+    for key, val in weights.items():
+        m = _QKV_KEY.match(key)
+        if m:
+            qkv.setdefault((m["prefix"], m["param"]), {})[m["proj"]] = val
+            continue
+        m = _GATE_UP_KEY.match(key)
+        if m:
+            gate_up.setdefault(m["prefix"], {})[m["proj"]] = val
+            continue
+        out[key] = val
+
+    for (prefix, param), parts in qkv.items():
+        if set(parts) != {"q", "k", "v"}:
+            raise KeyError(f"{prefix}.{param}: q/k/v 不齐，实际拿到 {sorted(parts)}")
+        out[f"{prefix}.qkv_proj.{param}"] = torch.cat(
+            [parts["q"], parts["k"], parts["v"]], dim=0
+        )
+    for prefix, parts in gate_up.items():
+        if set(parts) != {"gate", "up"}:
+            raise KeyError(f"{prefix}.gate_up_proj.weight: gate/up 不齐，实际拿到 {sorted(parts)}")
+        out[f"{prefix}.gate_up_proj.weight"] = torch.cat([parts["gate"], parts["up"]], dim=0)
+    return out
 
 
 class RMSNorm(nn.Module):
@@ -80,17 +134,57 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 
 class Attention(nn.Module):
-    def __init__(self, config: Qwen2Config) -> None:
+    def __init__(self, config: Qwen2Config, prejoin: bool = True) -> None:
         super().__init__()
         self.num_heads = config.num_attention_heads
         self.num_kv_heads = config.num_key_value_heads
         self.num_kv_groups = config.num_kv_groups
         self.head_dim = config.head_dim
         self.scaling = config.head_dim**-0.5
-        self.q_proj = nn.Linear(config.hidden_size, config.num_attention_heads * config.head_dim, bias=True)
-        self.k_proj = nn.Linear(config.hidden_size, config.num_key_value_heads * config.head_dim, bias=True)
-        self.v_proj = nn.Linear(config.hidden_size, config.num_key_value_heads * config.head_dim, bias=True)
+        self.prejoin = prejoin
+        if prejoin:
+            # P8 · 预拼接：3 次 GEMM → 1 次。输出维按 [q, k, v] 排列，与
+            # `_prejoin_state_dict` 的 cat 顺序、`_project_qkv` 的 split 顺序三者一致。
+            self.qkv_proj = nn.Linear(
+                config.hidden_size,
+                (config.num_attention_heads + 2 * config.num_key_value_heads) * config.head_dim,
+                bias=True,
+            )
+        else:
+            self.q_proj = nn.Linear(config.hidden_size, config.num_attention_heads * config.head_dim, bias=True)
+            self.k_proj = nn.Linear(config.hidden_size, config.num_key_value_heads * config.head_dim, bias=True)
+            self.v_proj = nn.Linear(config.hidden_size, config.num_key_value_heads * config.head_dim, bias=True)
         self.o_proj = nn.Linear(config.num_attention_heads * config.head_dim, config.hidden_size, bias=False)
+
+    def _project_qkv(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """QKV 投影 → `[b, heads, s, head_dim]` 三件套（预拼接 / 原始三投影两条路径）。
+
+        预拼接路径用 `unflatten` 而**不是** `view`：`split` 出来的切片不是连续张量
+        （行 stride 仍是合并后的总宽），`view` 会直接报错；而 `unflatten` 只作用于
+        最后一维（该维 stride 恒为 1），所以仍是**零拷贝视图**，不会引入额外 copy kernel
+        ——否则「3 GEMM 合 1」省下的开销会被切片的拷贝 kernel 吃回去。
+        """
+        if self.prejoin:
+            qkv = self.qkv_proj(hidden_states)
+            q, k, v = qkv.split(
+                (
+                    self.num_heads * self.head_dim,
+                    self.num_kv_heads * self.head_dim,
+                    self.num_kv_heads * self.head_dim,
+                ),
+                dim=-1,
+            )
+        else:
+            q = self.q_proj(hidden_states)
+            k = self.k_proj(hidden_states)
+            v = self.v_proj(hidden_states)
+        return (
+            q.unflatten(-1, (self.num_heads, self.head_dim)).transpose(1, 2),
+            k.unflatten(-1, (self.num_kv_heads, self.head_dim)).transpose(1, 2),
+            v.unflatten(-1, (self.num_kv_heads, self.head_dim)).transpose(1, 2),
+        )
 
     def _sdpa(
         self,
@@ -254,9 +348,7 @@ class Attention(nn.Module):
         metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
         b, s, _ = hidden_states.shape
-        q = self.q_proj(hidden_states).view(b, s, self.num_heads, self.head_dim).transpose(1, 2)
-        k = self.k_proj(hidden_states).view(b, s, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        v = self.v_proj(hidden_states).view(b, s, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        q, k, v = self._project_qkv(hidden_states)
 
         cos, sin = position_embeddings
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
@@ -293,22 +385,35 @@ class Attention(nn.Module):
 
 
 class MLP(nn.Module):
-    def __init__(self, config: Qwen2Config) -> None:
+    def __init__(self, config: Qwen2Config, prejoin: bool = True) -> None:
         super().__init__()
-        self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+        self.prejoin = prejoin
+        self.intermediate_size = config.intermediate_size
+        if prejoin:
+            # P8 · 预拼接：2 次 GEMM → 1 次。输出维按 [gate, up] 排列。
+            self.gate_up_proj = nn.Linear(
+                config.hidden_size, 2 * config.intermediate_size, bias=False
+            )
+        else:
+            self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+            self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
         self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
         self.act_fn = nn.SiLU()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        if self.prejoin:
+            # 与 `_prejoin_state_dict` 的 cat([gate, up]) 顺序对应
+            gate, up = self.gate_up_proj(x).split(self.intermediate_size, dim=-1)
+        else:
+            gate, up = self.gate_proj(x), self.up_proj(x)
+        return self.down_proj(self.act_fn(gate) * up)
 
 
 class DecoderLayer(nn.Module):
-    def __init__(self, config: Qwen2Config) -> None:
+    def __init__(self, config: Qwen2Config, prejoin: bool = True) -> None:
         super().__init__()
-        self.self_attn = Attention(config)
-        self.mlp = MLP(config)
+        self.self_attn = Attention(config, prejoin)
+        self.mlp = MLP(config, prejoin)
         self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
 
@@ -342,10 +447,12 @@ class DecoderLayer(nn.Module):
 
 
 class Qwen2Model(nn.Module):
-    def __init__(self, config: Qwen2Config) -> None:
+    def __init__(self, config: Qwen2Config, prejoin: bool = True) -> None:
         super().__init__()
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
-        self.layers = nn.ModuleList(DecoderLayer(config) for _ in range(config.num_hidden_layers))
+        self.layers = nn.ModuleList(
+            DecoderLayer(config, prejoin) for _ in range(config.num_hidden_layers)
+        )
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.rotary_emb = RotaryEmbedding(config.head_dim, config.rope_theta)
 
@@ -388,10 +495,11 @@ class Qwen2Model(nn.Module):
 
 
 class Qwen2ForCausalLM(nn.Module):
-    def __init__(self, config: Qwen2Config) -> None:
+    def __init__(self, config: Qwen2Config, prejoin: bool = True) -> None:
         super().__init__()
         self.config = config
-        self.model = Qwen2Model(config)
+        self.prejoin = prejoin
+        self.model = Qwen2Model(config, prejoin)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         if config.tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight
@@ -450,6 +558,11 @@ class Qwen2ForCausalLM(nn.Module):
         if self.config.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
             weights["lm_head.weight"] = weights["model.embed_tokens.weight"]
+        if self.prejoin:
+            # P8 · 键重映射必须在 `load_state_dict` **之前**：下方对 unexpected 键直接
+            # raise，原始的 q/k/v_proj（3×28 层 ×weight+bias）若不在这里被消费掉，
+            # 会被判为「权重文件中存在未知键」而加载失败。
+            weights = _prejoin_state_dict(weights)
         missing, unexpected = self.load_state_dict(weights, strict=False)
         if unexpected:
             raise KeyError(f"权重文件中存在未知键: {unexpected[:5]}")
