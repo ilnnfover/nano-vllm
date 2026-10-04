@@ -94,6 +94,7 @@ def measure(args, patch: str, device: str, dtype) -> tuple[int, dict[str, int], 
         num_blocks=args.num_blocks,
         attn_impl=args.attn_impl if device == "cuda" else "torch",
         prejoin=args.prejoin,
+        fused_norm=args.fused_norm,
         enable_cudagraph=args.cudagraph if device == "cuda" else False,
     )
     sched = Scheduler(
@@ -150,6 +151,8 @@ def main() -> None:
                     help="是否启用 P7 图（仅 attn_impl=triton 生效）")
     ap.add_argument("--prejoin", action=argparse.BooleanOptionalAction, default=True,
                     help="P8 权重预拼接（QKV 3→1 / gate-up 2→1）；--no-prejoin 即拼接前的对照")
+    ap.add_argument("--fused-norm", action=argparse.BooleanOptionalAction, default=True,
+                    help="P8 RMSNorm 融合（逐 op → 单 kernel）；--no-fused-norm 即融合前的对照")
     ap.add_argument("--quick", action="store_true", help="跳过同构性交叉校验")
     ap.add_argument("--top", type=int, default=15, help="名称分解打印条数")
     ap.add_argument("--tag", default="layer_kernels")
@@ -170,7 +173,7 @@ def main() -> None:
     elapsed = time.perf_counter() - t0
 
     print(f"\n配置: batch={args.batch} attn_impl={args.attn_impl} "
-          f"prejoin={args.prejoin} "
+          f"prejoin={args.prejoin} fused_norm={args.fused_norm} "
           f"cudagraph={bool(args.cudagraph and args.attn_impl == 'triton')} "
           f"prompt_len={args.prompt_len}")
     print(f"整模型一步 kernel 数     : {total}")
@@ -196,6 +199,7 @@ def main() -> None:
             "prompt_len": args.prompt_len,
             "attn_impl": args.attn_impl,
             "prejoin": bool(args.prejoin),
+            "fused_norm": bool(args.fused_norm),
             "cudagraph": bool(args.cudagraph and args.attn_impl == "triton"),
             "warmup_steps": args.warmup_steps,
             "layer_idx_for_check": args.layer_idx,

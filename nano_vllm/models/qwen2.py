@@ -75,12 +75,21 @@ def _prejoin_state_dict(weights: dict[str, torch.Tensor]) -> dict[str, torch.Ten
 
 
 class RMSNorm(nn.Module):
-    def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
+    def __init__(self, hidden_size: int, eps: float = 1e-6, fused: bool = True) -> None:
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
+        self.fused = fused
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self.fused:
+            # P8 ② · 融合路径：`F.rms_norm` 内部按 fp32 累加均方，整条 RMSNorm 落到
+            # **单个** elementwise kernel；下面逐 op 版实测约 7 个 kernel。
+            # 数值口径一致（fp32 累加 + rsqrt + eps），差异仅来自归约顺序。
+            return F.rms_norm(
+                hidden_states, (self.weight.numel(),), self.weight, self.variance_epsilon
+            )
+        # 逐 op 版：与 HF `Qwen2RMSNorm` 逐行对齐，留作对拍基准（roadmap §6 两遍实现法）
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
@@ -410,12 +419,12 @@ class MLP(nn.Module):
 
 
 class DecoderLayer(nn.Module):
-    def __init__(self, config: Qwen2Config, prejoin: bool = True) -> None:
+    def __init__(self, config: Qwen2Config, prejoin: bool = True, fused_norm: bool = True) -> None:
         super().__init__()
         self.self_attn = Attention(config, prejoin)
         self.mlp = MLP(config, prejoin)
-        self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps, fused_norm)
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps, fused_norm)
 
     def forward(
         self,
@@ -447,13 +456,13 @@ class DecoderLayer(nn.Module):
 
 
 class Qwen2Model(nn.Module):
-    def __init__(self, config: Qwen2Config, prejoin: bool = True) -> None:
+    def __init__(self, config: Qwen2Config, prejoin: bool = True, fused_norm: bool = True) -> None:
         super().__init__()
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList(
-            DecoderLayer(config, prejoin) for _ in range(config.num_hidden_layers)
+            DecoderLayer(config, prejoin, fused_norm) for _ in range(config.num_hidden_layers)
         )
-        self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps, fused_norm)
         self.rotary_emb = RotaryEmbedding(config.head_dim, config.rope_theta)
 
     def forward(
@@ -495,11 +504,12 @@ class Qwen2Model(nn.Module):
 
 
 class Qwen2ForCausalLM(nn.Module):
-    def __init__(self, config: Qwen2Config, prejoin: bool = True) -> None:
+    def __init__(self, config: Qwen2Config, prejoin: bool = True, fused_norm: bool = True) -> None:
         super().__init__()
         self.config = config
         self.prejoin = prejoin
-        self.model = Qwen2Model(config, prejoin)
+        self.fused_norm = fused_norm
+        self.model = Qwen2Model(config, prejoin, fused_norm)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         if config.tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight

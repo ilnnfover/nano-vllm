@@ -130,6 +130,9 @@ roadmap P8 的完成标准是「**单层** kernel launch 数下降 ≥30%（prof
 > 与权重预拼接无关。①的真实收益在 **GEMM 数**上：每层 7 个 Linear → 4 个（−3 个 `cutlass::Kernel2`）、
 > 合并后不再触发 split-k（−2 个 `cublasLt::splitKreduce_kernel`）、净增 1 个 elementwise
 > ⇒ **−4/层**（42 → 38）。详见 `docs/notes/p8-prejoin.md`。
+>
+> **后续进展**：② 「融合 RMSNorm」再 −14/层，当前默认 **24.0 个/层**（P8 起点 42.0，累计 −42.9%）；
+> 见 `docs/notes/p8-fused-norm.md`。上面这个「42」的基线文件已刷新为 28.0（与当前默认只差一个开关）。
 
 ---
 
