@@ -22,6 +22,7 @@ from nano_vllm.attention.triton_paged_attn import (
 from nano_vllm.attention.varlen_prefill import varlen_prefill_attention
 from nano_vllm.config import Qwen2Config
 from nano_vllm.ops.fused_norm import fused_add_rms_norm, rms_norm
+from nano_vllm.ops.rope import apply_rope
 
 
 # ------------------------------------------------------- P8 · 权重预拼接（load 期）
@@ -183,7 +184,9 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 
 class Attention(nn.Module):
-    def __init__(self, config: Qwen2Config, prejoin: bool = True) -> None:
+    def __init__(
+        self, config: Qwen2Config, prejoin: bool = True, rope_impl: str = "triton"
+    ) -> None:
         super().__init__()
         self.num_heads = config.num_attention_heads
         self.num_kv_heads = config.num_key_value_heads
@@ -191,6 +194,7 @@ class Attention(nn.Module):
         self.head_dim = config.head_dim
         self.scaling = config.head_dim**-0.5
         self.prejoin = prejoin
+        self.rope_impl = rope_impl
         if prejoin:
             # P8 · 预拼接：3 次 GEMM → 1 次。输出维按 [q, k, v] 排列，与
             # `_prejoin_state_dict` 的 cat 顺序、`_project_qkv` 的 split 顺序三者一致。
@@ -400,7 +404,11 @@ class Attention(nn.Module):
         q, k, v = self._project_qkv(hidden_states)
 
         cos, sin = position_embeddings
-        q, k = apply_rotary_pos_emb(q, k, cos, sin)
+        if self.rope_impl == "triton":
+            # P8 ③ · 自研融合核：整段 RoPE 一个 kernel（torch 参考要 ~4 个/层）
+            q, k = apply_rope(q, k, cos, sin)
+        else:
+            q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
         if paged_cache is not None:
             return self._forward_paged(q, k, v, paged_cache, layer_idx, metadata, b, s)
@@ -474,10 +482,14 @@ class DecoderLayer(nn.Module):
     """
 
     def __init__(
-        self, config: Qwen2Config, prejoin: bool = True, norm_impl: str = "triton"
+        self,
+        config: Qwen2Config,
+        prejoin: bool = True,
+        norm_impl: str = "triton",
+        rope_impl: str = "triton",
     ) -> None:
         super().__init__()
-        self.self_attn = Attention(config, prejoin)
+        self.self_attn = Attention(config, prejoin, rope_impl)
         self.mlp = MLP(config, prejoin)
         self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps, norm_impl)
         self.post_attention_layernorm = RMSNorm(
@@ -528,12 +540,17 @@ class DecoderLayer(nn.Module):
 
 class Qwen2Model(nn.Module):
     def __init__(
-        self, config: Qwen2Config, prejoin: bool = True, norm_impl: str = "triton"
+        self,
+        config: Qwen2Config,
+        prejoin: bool = True,
+        norm_impl: str = "triton",
+        rope_impl: str = "triton",
     ) -> None:
         super().__init__()
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList(
-            DecoderLayer(config, prejoin, norm_impl) for _ in range(config.num_hidden_layers)
+            DecoderLayer(config, prejoin, norm_impl, rope_impl)
+            for _ in range(config.num_hidden_layers)
         )
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps, norm_impl)
         self.rotary_emb = RotaryEmbedding(config.head_dim, config.rope_theta)
@@ -586,13 +603,18 @@ class Qwen2Model(nn.Module):
 
 class Qwen2ForCausalLM(nn.Module):
     def __init__(
-        self, config: Qwen2Config, prejoin: bool = True, norm_impl: str = "triton"
+        self,
+        config: Qwen2Config,
+        prejoin: bool = True,
+        norm_impl: str = "triton",
+        rope_impl: str = "triton",
     ) -> None:
         super().__init__()
         self.config = config
         self.prejoin = prejoin
         self.norm_impl = norm_impl
-        self.model = Qwen2Model(config, prejoin, norm_impl)
+        self.rope_impl = rope_impl
+        self.model = Qwen2Model(config, prejoin, norm_impl, rope_impl)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         if config.tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight

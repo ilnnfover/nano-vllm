@@ -41,6 +41,7 @@ class NanoRunner:
         prefill_impl: str = "torch",
         prejoin: bool = True,
         norm_impl: str = "triton",
+        rope_impl: str = "triton",
         enable_cudagraph: bool | None = None,
         cudagraph_buckets: tuple[int, ...] | None = None,
     ) -> None:
@@ -55,6 +56,8 @@ class NanoRunner:
         # 自研核只在 CUDA 上跑，故非 CUDA **显式降级**到 oracle —— 不做设备相关的静默分支
         # （P0-07 的教训：数值路径不应随设备悄悄切换）。
         self.norm_impl = norm_impl if device == "cuda" else "torch"
+        # P8 ③ · RoPE：torch（HF 参考）/ triton（自研融合核）；同样显式降级
+        self.rope_impl = rope_impl if device == "cuda" else "torch"
         self.enable_cudagraph = (
             (device == "cuda" and torch.cuda.is_available() and attn_impl == "triton")
             if enable_cudagraph is None
@@ -63,7 +66,8 @@ class NanoRunner:
         self.cudagraph_buckets = cudagraph_buckets
         self.config = Qwen2Config.from_json(Path(model_path) / "config.json")
         self.model = Qwen2ForCausalLM(
-            self.config, prejoin=prejoin, norm_impl=self.norm_impl
+            self.config, prejoin=prejoin, norm_impl=self.norm_impl,
+            rope_impl=self.rope_impl,
         ).to(device=device, dtype=dtype).eval()
         self.model.load_weights(model_path)
         self.sampler = Sampler(device)

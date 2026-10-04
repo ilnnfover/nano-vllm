@@ -5,5 +5,6 @@ from nano_vllm.ops.fused_norm import (
     fused_add_rms_norm as fused_add_rms_norm,
     rms_norm as rms_norm,
 )
+from nano_vllm.ops.rope import apply_rope as apply_rope
 
-__all__ = ["fused_add_rms_norm", "rms_norm"]
+__all__ = ["apply_rope", "fused_add_rms_norm", "rms_norm"]
