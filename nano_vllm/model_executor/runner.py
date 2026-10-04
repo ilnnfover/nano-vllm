@@ -42,6 +42,7 @@ class NanoRunner:
         prejoin: bool = True,
         norm_impl: str = "triton",
         rope_impl: str = "triton",
+        mlp_impl: str = "triton",
         enable_cudagraph: bool | None = None,
         cudagraph_buckets: tuple[int, ...] | None = None,
     ) -> None:
@@ -58,6 +59,8 @@ class NanoRunner:
         self.norm_impl = norm_impl if device == "cuda" else "torch"
         # P8 ③ · RoPE：torch（HF 参考）/ triton（自研融合核）；同样显式降级
         self.rope_impl = rope_impl if device == "cuda" else "torch"
+        # P8 ④ · SwiGLU 融合（silu(gate)*up 一次 kernel）；同样显式降级
+        self.mlp_impl = mlp_impl if device == "cuda" else "torch"
         self.enable_cudagraph = (
             (device == "cuda" and torch.cuda.is_available() and attn_impl == "triton")
             if enable_cudagraph is None
@@ -68,6 +71,7 @@ class NanoRunner:
         self.model = Qwen2ForCausalLM(
             self.config, prejoin=prejoin, norm_impl=self.norm_impl,
             rope_impl=self.rope_impl,
+            mlp_impl=self.mlp_impl,
         ).to(device=device, dtype=dtype).eval()
         self.model.load_weights(model_path)
         self.sampler = Sampler(device)

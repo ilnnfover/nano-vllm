@@ -48,6 +48,7 @@ def create_app(
     prejoin: bool = True,
     norm_impl: str = "triton",
     rope_impl: str = "triton",
+    mlp_impl: str = "triton",
     prefill_mode: str = "batched",
     enable_prefix_cache: bool = True,
     max_num_seqs: int | None = None,
@@ -59,7 +60,7 @@ def create_app(
         model_path, device=device, dtype=dt,
         max_seq_len=max_seq_len, block_size=block_size, num_blocks=num_blocks,
         attn_impl=attn_impl, prefill_impl=prefill_impl,
-        prejoin=prejoin, norm_impl=norm_impl, rope_impl=rope_impl,
+        prejoin=prejoin, norm_impl=norm_impl, rope_impl=rope_impl, mlp_impl=mlp_impl,
     )
     scheduler = Scheduler(
         paged_cache=runner.paged_cache,
@@ -172,6 +173,8 @@ def main() -> None:
                    help="RMSNorm 实现：torch（逐 op oracle）/ lib（F.rms_norm）/ triton（自研融合核）")
     p.add_argument("--rope-impl", default="triton", choices=["torch", "triton"],
                    help="RoPE 实现：torch（HF 参考）/ triton（自研融合核）")
+    p.add_argument("--mlp-impl", default="triton", choices=["torch", "triton"],
+                   help="SwiGLU 实现：torch（silu+mul 两步）/ triton（融合核）")
     p.add_argument("--no-prefix-cache", dest="enable_prefix_cache", action="store_false",
                    default=True, help="关闭 P6 前缀缓存（默认开启）")
     p.add_argument("--max-num-seqs", type=int, default=None,
@@ -193,6 +196,7 @@ def main() -> None:
         max_num_batched_tokens=args.budget, attn_impl=args.attn_impl,
         prefill_impl=args.prefill_impl, prefill_mode=args.prefill_mode,
         prejoin=args.prejoin, norm_impl=args.norm_impl, rope_impl=args.rope_impl,
+        mlp_impl=args.mlp_impl,
         enable_prefix_cache=args.enable_prefix_cache,
         max_num_seqs=args.max_num_seqs,
         long_prefill_token_threshold=args.long_prefill_threshold,

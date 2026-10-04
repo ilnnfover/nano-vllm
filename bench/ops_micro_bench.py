@@ -7,6 +7,7 @@
 | --- | --- | --- |
 | `rms_norm` / `fused_add_rms_norm` | 逐 op / `F.rms_norm` / `aten::add` + `F.rms_norm` | 自研核 vs 库算子谁快；`num_warps` 怎么选 |
 | `apply_rope` | `qwen2.apply_rotary_pos_emb`（cat + 3 个 elementwise） | 融合成 1 个 kernel 的绝对时间 vs torch 写的 ~4 个 |
+| `swiglu` | `F.silu(gate) * up`（`aten::silu` + `aten::mul`） | 省掉一个 kernel 值多少 µs（本项只有 −1 kernel/层，更要看绝对时间） |
 
 **为什么微基准值得做**：端到端只有 −2 或 −8 kernel/层 的收益，容易被整步噪声淹没；
 微基准把"每个算子省了多少 µs"单独拿到，才能判断某项融合的真实性价比
@@ -37,6 +38,7 @@ import torch.nn.functional as F
 from nano_vllm.models.qwen2 import apply_rotary_pos_emb as rope_ref
 from nano_vllm.ops.fused_norm import fused_add_rms_norm, rms_norm
 from nano_vllm.ops.rope import apply_rope
+from nano_vllm.ops.swiglu import swiglu
 
 RESULTS_DIR = Path(__file__).resolve().parent / "results"
 
@@ -125,9 +127,34 @@ def bench_rope(args, out: dict) -> None:
               + (f"（{t_ref / best:.2f}×）" if best < t_ref else ""))
 
 
+def bench_swiglu(args, out: dict) -> None:
+    """SwiGLU：自研融合核（1 个）vs `F.silu(gate) * up`（2 个 kernel）。
+
+    用**真实布局**：gate/up 取自同一合并缓冲区（预拼接后就是这个样子）→ 非连续切片视图。
+    """
+    B, H = 8, args.inter
+    print(f"\n[SwiGLU] intermediate={H}（gate/up 取合并缓冲区的两半，非连续视图）")
+    print(f"  {'(b,s)':>9} {'torch 两步':>12}"
+          + "".join(f"{'ours w=' + str(w):>12}" for w in args.swiglu_num_warps))
+    for b, s in args.swiglu_shapes:
+        torch.manual_seed(0)
+        merged = torch.randn(b, s, 2 * H, device="cuda", dtype=torch.bfloat16)
+        gate, up = merged.split(H, dim=-1)
+        t_ref = _time_us(lambda: F.silu(gate) * up, args.iters, args.rounds)
+        ours = {nw: _time_us(lambda nw=nw: swiglu(gate, up, num_warps=nw),
+                             args.iters, args.rounds) for nw in args.swiglu_num_warps}
+        out["swiglu"][f"{b}x{s}"] = {"torch_two_step_us": round(t_ref, 2),
+                                     "ours_us": {str(k2): round(v, 2) for k2, v in ours.items()}}
+        best = min(ours.values())
+        print(f"  {f'{b}x{s}':>9} {t_ref:>12.2f}"
+              + "".join(f"{ours[w]:>12.2f}" for w in args.swiglu_num_warps)
+              + f"   | 最快 {best:.2f} vs 两步 {t_ref:.2f}"
+              + (f"（{t_ref / best:.2f}×）" if best < t_ref else ""))
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--only", default="all", choices=["all", "norm", "rope"])
+    ap.add_argument("--only", default="all", choices=["all", "norm", "rope", "swiglu"])
     ap.add_argument("--H", type=int, default=1536, help="hidden 宽（1.5B 是 1536，非 2 的幂）")
     ap.add_argument("--rows", type=int, nargs="+", default=[1, 4, 8, 16, 32, 512])
     ap.add_argument("--num-warps", type=int, nargs="+", default=[1, 2, 4, 8, 16])
@@ -135,6 +162,11 @@ def main() -> None:
                     nargs="+", default=[(8, 1), (32, 1), (1, 200), (4, 64)],
                     help="RoPE 的 (batch, seq) 组合；decode 是 s=1")
     ap.add_argument("--rope-num-warps", type=int, nargs="+", default=[1, 2, 4])
+    ap.add_argument("--inter", type=int, default=8960, help="MLP intermediate（1.5B 是 8960）")
+    ap.add_argument("--swiglu-shapes", type=lambda s: tuple(int(x) for x in s.split("x")),
+                    nargs="+", default=[(8, 1), (32, 1), (1, 200), (4, 64)],
+                    help="SwiGLU 的 (batch, seq) 组合")
+    ap.add_argument("--swiglu-num-warps", type=int, nargs="+", default=[4, 8])
     ap.add_argument("--iters", type=int, default=200)
     ap.add_argument("--rounds", type=int, default=7)
     ap.add_argument("--tag", default="ops_micro_bench")
@@ -149,12 +181,14 @@ def main() -> None:
                           "torch": torch.__version__,
                           "gpu": torch.cuda.get_device_name(0),
                           "time": time.strftime("%Y-%m-%d %H:%M:%S")},
-                 "rms_norm": {}, "fused_add": {}, "rope": {}}
+                 "rms_norm": {}, "fused_add": {}, "rope": {}, "swiglu": {}}
 
     if args.only in ("all", "norm"):
         bench_norm(args, out)
     if args.only in ("all", "rope"):
         bench_rope(args, out)
+    if args.only in ("all", "swiglu"):
+        bench_swiglu(args, out)
 
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     path = RESULTS_DIR / f"{args.tag}.json"

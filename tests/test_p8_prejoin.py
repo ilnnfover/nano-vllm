@@ -158,8 +158,10 @@ class TestPrejoinForwardEquivalence(unittest.TestCase):
 
     def test_mlp_matches_two_linears(self) -> None:
         torch.manual_seed(0)
-        ref = MLP(self.cfg, prejoin=False)
-        new = MLP(self.cfg, prejoin=True)
+        # 显式 mlp_impl="torch"：本条测的是**预拼接的权重布局**（CPU 上跑），
+        # 不需要 SwiGLU 融合核（它有独立单测，且 Triton 核只在 CUDA 可用）
+        ref = MLP(self.cfg, prejoin=False, mlp_impl="torch")
+        new = MLP(self.cfg, prejoin=True, mlp_impl="torch")
         with torch.no_grad():
             new.gate_up_proj.weight.copy_(
                 torch.cat([ref.gate_proj.weight, ref.up_proj.weight], dim=0)

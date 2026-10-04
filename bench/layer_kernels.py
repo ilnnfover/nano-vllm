@@ -104,6 +104,7 @@ def measure(args, patch: str, device: str, dtype) -> tuple[int, dict[str, int], 
         prejoin=args.prejoin,
         norm_impl=args.norm_impl,
         rope_impl=args.rope_impl,
+        mlp_impl=args.mlp_impl,
         enable_cudagraph=args.cudagraph if device == "cuda" else False,
     )
     sched = Scheduler(
@@ -164,6 +165,8 @@ def main() -> None:
                     help="RMSNorm 实现：torch（逐 op oracle）/ lib（F.rms_norm）/ triton（自研融合核）")
     ap.add_argument("--rope-impl", default="triton", choices=["torch", "triton"],
                     help="RoPE 实现：torch（HF 参考）/ triton（自研融合核）")
+    ap.add_argument("--mlp-impl", default="triton", choices=["torch", "triton"],
+                    help="SwiGLU 实现：torch（silu+mul 两步）/ triton（融合核）")
     ap.add_argument("--quick", action="store_true", help="跳过同构性交叉校验")
     ap.add_argument("--top", type=int, default=15, help="名称分解打印条数")
     ap.add_argument("--tag", default="layer_kernels")
@@ -185,6 +188,7 @@ def main() -> None:
 
     print(f"\n配置: batch={args.batch} attn_impl={args.attn_impl} "
           f"prejoin={args.prejoin} norm_impl={args.norm_impl} rope_impl={args.rope_impl} "
+          f"mlp_impl={args.mlp_impl} "
           f"cudagraph={bool(args.cudagraph and args.attn_impl == 'triton')} "
           f"prompt_len={args.prompt_len}")
     print(f"整模型一步 kernel 数     : {total}")
@@ -212,6 +216,7 @@ def main() -> None:
             "prejoin": bool(args.prejoin),
             "norm_impl": args.norm_impl,
             "rope_impl": args.rope_impl,
+            "mlp_impl": args.mlp_impl,
             "cudagraph": bool(args.cudagraph and args.attn_impl == "triton"),
             "warmup_steps": args.warmup_steps,
             "layer_idx_for_check": args.layer_idx,

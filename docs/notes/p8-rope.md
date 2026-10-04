@@ -16,6 +16,9 @@
 | TPOT（eager） | 31.21 | 32.46 | 区间重叠，**不定论** |
 | **P8 累计**（①+②+③） | — | — | **42.0 → 14.0（−66.7%）** |
 
+> **2026-10-04 后续（④ SwiGLU 已落地）**：单层再降 1.0 到 **13.0**（P8 累计 42.0 → 13.0，−69.0%），
+> 但 ④ 的端到端 TPOT 在噪声内（只省 1 个 kernel）。见 `docs/notes/p8-swiglu.md`。
+
 数据：`bench/results/layer_kernels_ropetorch.json`（前）/ `layer_kernels.json`（后，当前默认）。
 
 ---

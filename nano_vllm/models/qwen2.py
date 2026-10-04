@@ -23,6 +23,7 @@ from nano_vllm.attention.varlen_prefill import varlen_prefill_attention
 from nano_vllm.config import Qwen2Config
 from nano_vllm.ops.fused_norm import fused_add_rms_norm, rms_norm
 from nano_vllm.ops.rope import apply_rope
+from nano_vllm.ops.swiglu import swiglu
 
 
 # ------------------------------------------------------- P8 · 权重预拼接（load 期）
@@ -442,9 +443,12 @@ class Attention(nn.Module):
 
 
 class MLP(nn.Module):
-    def __init__(self, config: Qwen2Config, prejoin: bool = True) -> None:
+    def __init__(
+        self, config: Qwen2Config, prejoin: bool = True, mlp_impl: str = "triton"
+    ) -> None:
         super().__init__()
         self.prejoin = prejoin
+        self.mlp_impl = mlp_impl
         self.intermediate_size = config.intermediate_size
         if prejoin:
             # P8 · 预拼接：2 次 GEMM → 1 次。输出维按 [gate, up] 排列。
@@ -463,6 +467,10 @@ class MLP(nn.Module):
             gate, up = self.gate_up_proj(x).split(self.intermediate_size, dim=-1)
         else:
             gate, up = self.gate_proj(x), self.up_proj(x)
+        if self.mlp_impl == "triton":
+            # P8 ④ · `silu(gate) * up` 一次融合；torch 参考是 aten::silu + aten::mul 两个 kernel。
+            # 注意 gate/up 是合并缓冲区上的**非连续切片**，核按 stride 寻址（见 ops/swiglu.py）。
+            return self.down_proj(swiglu(gate, up))
         return self.down_proj(self.act_fn(gate) * up)
 
 
@@ -487,10 +495,11 @@ class DecoderLayer(nn.Module):
         prejoin: bool = True,
         norm_impl: str = "triton",
         rope_impl: str = "triton",
+        mlp_impl: str = "triton",
     ) -> None:
         super().__init__()
         self.self_attn = Attention(config, prejoin, rope_impl)
-        self.mlp = MLP(config, prejoin)
+        self.mlp = MLP(config, prejoin, mlp_impl)
         self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps, norm_impl)
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, config.rms_norm_eps, norm_impl
@@ -545,11 +554,12 @@ class Qwen2Model(nn.Module):
         prejoin: bool = True,
         norm_impl: str = "triton",
         rope_impl: str = "triton",
+        mlp_impl: str = "triton",
     ) -> None:
         super().__init__()
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList(
-            DecoderLayer(config, prejoin, norm_impl, rope_impl)
+            DecoderLayer(config, prejoin, norm_impl, rope_impl, mlp_impl)
             for _ in range(config.num_hidden_layers)
         )
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps, norm_impl)
@@ -594,7 +604,10 @@ class Qwen2Model(nn.Module):
                     hidden_states if residual is None else residual + hidden_states
                 )
 
-        # 最后一层欠的加法与 final norm 一起收口
+        # 最后一层欠的加法与 final norm 一起收口。
+        # `residual is None` 只可能出现在「一层都没有」的退化模型上，显式失败而不是靠类型断言（D4）。
+        if residual is None:
+            raise RuntimeError("延迟残差链断裂：没有解码层，final norm 无残差可收口")
         hidden_states = self.norm.forward_with_residual(hidden_states, residual)[0]
         if all_hidden is not None:
             all_hidden[-1] = hidden_states
@@ -608,13 +621,15 @@ class Qwen2ForCausalLM(nn.Module):
         prejoin: bool = True,
         norm_impl: str = "triton",
         rope_impl: str = "triton",
+        mlp_impl: str = "triton",
     ) -> None:
         super().__init__()
         self.config = config
         self.prejoin = prejoin
         self.norm_impl = norm_impl
         self.rope_impl = rope_impl
-        self.model = Qwen2Model(config, prejoin, norm_impl, rope_impl)
+        self.mlp_impl = mlp_impl
+        self.model = Qwen2Model(config, prejoin, norm_impl, rope_impl, mlp_impl)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         if config.tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight

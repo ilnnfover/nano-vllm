@@ -175,8 +175,19 @@ eager 档的退步也复现了两次（第一轮 −2.0 ms、第二轮 −1.4 ms
    与 P7 的结论（"eager 的瓶颈在 CPU 侧 launch，图把它打掉"）方向一致。
 
 **假说**：eager 档的退步来自 Triton launch 的 CPU 开销 > 省下的 `aten::add`。
-未验证（没有单独量过两者的 host 侧时间），下一步可用 `bench/layer_kernels.py` 的 profiler
-加一路 CPU 侧计时来确认。
+
+> **✅ 2026-10-04 已证实**（④ 落地时拿到数据）。三个自研核的微基准放一起，规律一致：
+>
+> | 核 | 自研（每次 launch） | 对照 | 差 |
+> | --- | --- | --- | --- |
+> | `rms_norm` | ~19 µs | `F.rms_norm` ~11 µs | +8 |
+> | `swiglu` | ~25–29 µs | `aten::silu`+`mul` 两次 ~17–19 µs | +10 |
+> | `apply_rope` | ~24 µs（2 次 48） | torch 参考 ~95 µs（~4 次） | **−45** |
+>
+> 即**自研核单次 launch 比 ATen 贵约 10–20 µs**；只有当"少掉的 launch 数 × ATen 单价"
+> 覆盖这个差价时才赢（RoPE 省 8 个/层 ⇒ 大幅赢；SwiGLU 只省 1 个 ⇒ 平）
+> —— 这同时解释了为什么 SwiGLU 在图开档也测不出 TPOT 收益。
+> 详见 `docs/notes/p8-swiglu.md` §5。原文所谓「SM 欠占」是次要因素（只在小 row 数下叠加）。
 
 ### 6.4 由此得到的默认值选择
 
